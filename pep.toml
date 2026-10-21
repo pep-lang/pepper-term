@@ -1,6 +1,6 @@
 [package]
-name = "mypkg"
+name = "term"
 version = "0.1.0"
-description = "One line saying what the package does"
+description = "Interactive terminals: raw mode, key input, line editing with history, cursor control and colors"
 license = "Apache-2.0"
-repository = "https://github.com/OWNER/pepper-mypkg"
+repository = "https://github.com/pep-lang/pepper-term"
