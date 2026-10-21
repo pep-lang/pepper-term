@@ -120,3 +120,12 @@ scrolls_a_line_wider_than_the_terminal() {
     expect_equal(editor.render("> ", 10), "\r> abcdefg\x1B[K\x1B[7D");
     expect_equal(editor.render("> ", 20), "\r> abcdefghij\x1B[K\x1B[10D");
 }
+
+[Test]
+measures_a_colored_prompt_by_what_shows() {
+    var editor = LineEditor();
+    type_into(editor, "abcdefg");
+    # "> " in green takes 2 columns, so all 7 characters fit in 10.
+    var prompt = "\x1B[1;32m> \x1B[0m";
+    expect_equal(editor.render(prompt, 10), "\r" + prompt + "abcdefg\x1B[K");
+}

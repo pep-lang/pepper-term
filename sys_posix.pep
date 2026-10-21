@@ -108,7 +108,8 @@ _term_read(buffer: u8[], timeout: int): long {
     poll_fd[1] = 1;  # events = POLLIN, revents = 0
     var ready = poll(poll_fd, 1, timeout);
     free(poll_fd);
-    if (ready == 0) {
+    if (ready <= 0) {
+        # Timed out, or interrupted by a signal: the caller tries again.
         return 0;
     }
     __ptr<u8> bytes = malloc(1024);

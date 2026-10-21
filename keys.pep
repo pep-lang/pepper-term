@@ -84,10 +84,8 @@ export struct KeyEvent {
         this.shift = shift;
     }
 
-    ## Returns the event with `alt` set too.
-    ##
-    ## @returns a new event, the same key with Alt held
-    with_alt(): KeyEvent {
+    # The same key with Alt held too.
+    _with_alt(): KeyEvent {
         return KeyEvent(key, text, number, ctrl, true, shift);
     }
 
@@ -209,8 +207,9 @@ export struct KeyDecoder {
         }
         var second = _pending[start + 1];
         if (second == '[' || second == 'O') {
-            var (size, event) = _decode_sequence(start + 2, second == 'O');
-            if (size > 0) {
+            var sequence = _decode_sequence(start + 2, second == 'O');
+            if (!sequence.is_empty()) {
+                var (size, event) = sequence.value();
                 return (size + 2, event);
             }
             if (!final) {
@@ -226,13 +225,13 @@ export struct KeyDecoder {
         if (size == 0) {
             return (0, unknown);
         }
-        return (size + 1, event.with_alt());
+        return (size + 1, event._with_alt());
     }
 
     # Decodes a CSI sequence ("Escape [", `ss3` false) or an SS3 one
     # ("Escape O"), whose parameters start at `start`: the bytes after the
-    # introducer it takes, or 0 when it is not complete yet.
-    _decode_sequence(start: ulong, ss3: bool): (ulong, KeyEvent) {
+    # introducer it takes, or none when it is not complete yet.
+    _decode_sequence(start: ulong, ss3: bool): (ulong, KeyEvent)? {
         var parameters = Array<int>();
         var current = 0;
         var has_digits = false;
@@ -240,7 +239,10 @@ export struct KeyDecoder {
         while (index < _pending.count) {
             var c = _pending[index];
             if (c >= '0' && c <= '9') {
-                current = current * 10 + (c - '0') as int;
+                # Past any real key's number: stop growing, so it cannot overflow.
+                if (current < 100000) {
+                    current = current * 10 + (c - '0') as int;
+                }
                 has_digits = true;
             } else if (c == ';') {
                 parameters.append(current);
@@ -250,14 +252,15 @@ export struct KeyDecoder {
                 if (has_digits || parameters.count > 0) {
                     parameters.append(current);
                 }
-                return (index - start + 1, _sequence_key(c, parameters, ss3));
+                return Optional<(ulong, KeyEvent)>.Value((index - start + 1, _sequence_key(c, parameters, ss3)));
             } else if (c < 32 || c > 63) {
-                # Not a parameter byte: a broken sequence. Take what came.
-                return (index - start, KeyEvent(Key.Unknown));
+                # Not a parameter byte: a broken sequence. Take what came
+                # before it, which may be nothing.
+                return Optional<(ulong, KeyEvent)>.Value((index - start, KeyEvent(Key.Unknown)));
             }
             index += 1;
         }
-        return (0, KeyEvent(Key.Unknown));
+        return Optional<(ulong, KeyEvent)>.Empty;
     }
 
     _decode_utf8(start: ulong, final: bool): (ulong, KeyEvent) {

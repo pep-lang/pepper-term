@@ -109,3 +109,15 @@ reports_unknown_sequences() {
     expect_equal(names("\x1B[200~x"), "Unknown,x");
     expect_equal(names("\x1B[<0;3;4M"), "Unknown");
 }
+
+[Test]
+survives_broken_and_huge_sequences() {
+    # A control byte breaks the sequence, without holding the bytes back.
+    var decoder = KeyDecoder();
+    var events = decoder.feed("\x1B[\x01x".bytes());
+    expect_equal(events.count, 3);
+    expect_true(events[0].key == Key.Unknown);
+    expect_equal(events[1].to_string(), "Ctrl+a");
+    expect_false(decoder.has_pending);
+    expect_equal(names("\x1B[99999999999999999999A"), "Up");
+}

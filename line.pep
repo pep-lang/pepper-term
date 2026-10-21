@@ -184,8 +184,9 @@ export struct LineEditor {
         # wcwidth table when someone needs them.
         ulong first = 0;
         var last = _characters.count;
-        if (width > 0 && prompt.length + _characters.count + 1 > width) {
-            var room = width > prompt.length + 1 ? width - prompt.length - 1 : 1;
+        var shown_prompt = _visible_length(prompt);
+        if (width > 0 && shown_prompt + _characters.count + 1 > width) {
+            var room = width > shown_prompt + 1 ? width - shown_prompt - 1 : 1;
             first = _cursor > room ? _cursor - room : 0;
             last = first + room < _characters.count ? first + room : _characters.count;
         }
@@ -262,4 +263,29 @@ export struct LineEditor {
         _recalled = step < 0 ? _recalled - 1 : _recalled + 1;
         _set(_recalled == count ? _draft : history.entries[_recalled]);
     }
+}
+
+# The columns `text` takes on screen: its code points, without the CSI
+# escape sequences ("Escape [ ... final") that color it.
+_visible_length(text: String): ulong {
+    ulong count = 0;
+    var in_sequence = false;
+    var after_escape = false;
+    for (var c in text) {
+        if (after_escape) {
+            after_escape = false;
+            in_sequence = c == "[";
+            if (!in_sequence) {
+                count += 1;
+            }
+        } else if (in_sequence) {
+            var byte = c.byte_at(0);
+            in_sequence = byte < 64 || byte > 126;
+        } else if (c == "\x1B") {
+            after_escape = true;
+        } else {
+            count += 1;
+        }
+    }
+    return count;
 }
