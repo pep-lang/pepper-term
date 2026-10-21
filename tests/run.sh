@@ -43,17 +43,18 @@ case "$(uname -s)" in
     *) exit 0 ;;  # no pseudo-terminal to test on
 esac
 
-# A control first: the settings must not change with nothing run between.
-on_terminal "stty -g > '$build/before'; sleep 0.2; stty -g > '$build/after'" < /dev/null || true
-cat "$build/before" "$build/after"
-cmp "$build/before" "$build/after" || { echo "error: the terminal's settings change by themselves" >&2; exit 1; }
+# The settings as `stty -a` lists them, one per line. `pendin` is left out:
+# macOS's kernel sets it on its own when canonical mode comes back with
+# input pending (here the ^D `script` sends at the end of its input).
+settings() {
+    tr ' \t' '\n\n' < "$1" | grep -v -e '^-*pendin$' -e '^$' || true
+}
 
 for how in return panic signal forget; do
     rm -f "$build/before" "$build/after" "$build/said"
-    on_terminal "stty -g > '$build/before'; '$build/restore' $how > '$build/said' 2>&1; stty -g > '$build/after'" < /dev/null || true
+    on_terminal "stty -a > '$build/before'; '$build/restore' $how > '$build/said' 2>&1; stty -a > '$build/after'" < /dev/null || true
     grep -q '^raw' "$build/said" || { cat "$build/said" >&2; echo "error: $how: raw mode did not turn on" >&2; exit 1; }
-    cmp "$build/before" "$build/after" || {
-        cat "$build/before" "$build/after" >&2
+    diff <(settings "$build/before") <(settings "$build/after") || {
         echo "error: $how left the terminal in raw mode" >&2
         exit 1
     }
