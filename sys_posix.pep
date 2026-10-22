@@ -18,6 +18,8 @@ extern int poll(void* fds, ulong count, int timeout);
 [Target(OS(Linux) || OS(Mac))]
 extern long read(int fd, void* buffer, ulong size);
 [Target(OS(Linux) || OS(Mac))]
+extern long write(int fd, void* buffer, ulong size);
+[Target(OS(Linux) || OS(Mac))]
 extern void* signal(int number, void* handler);
 [Target(OS(Linux) || OS(Mac))]
 extern int raise(int number);
@@ -51,6 +53,15 @@ const _term_raw = async.Atomic<bool>(false);
 const _term_saved: __ptr<void> = malloc(_TERMIOS_SIZE);
 [Target(OS(Linux) || OS(Mac))]
 const _term_hooks = async.Once();
+
+# Whether mouse reporting is on, and the sequence that turns it off, kept
+# as bytes so a signal handler can write it without allocating.
+[Target(OS(Linux) || OS(Mac))]
+const _term_mouse = async.Atomic<bool>(false);
+[Target(OS(Linux) || OS(Mac))]
+const _MOUSE_OFF = "\x1B[?1006l\x1B[?1003l\x1B[?1002l\x1B[?1000l";
+[Target(OS(Linux) || OS(Mac))]
+const _term_mouse_off_bytes: __ptr<u8> = malloc(64);
 
 [Target(OS(Linux) || OS(Mac))]
 _term_is_terminal(fd: int): bool {
@@ -97,6 +108,41 @@ _term_restore() {
     }
 }
 
+# Asks the terminal for xterm's mouse reports of mode `code` (1000, 1002
+# or 1003), SGR-encoded: whether it did.
+[Target(OS(Linux) || OS(Mac))]
+_term_mouse_on(code: int): bool {
+    if (_term_mouse.load() || isatty(0) == 0 || isatty(1) == 0) {
+        return false;
+    }
+    _term_hooks.call(_term_install_hooks);
+    var off = _MOUSE_OFF.bytes();
+    for (var index in 0..off.count) {
+        _term_mouse_off_bytes[index] = off[index];
+    }
+    _term_mouse.store(true);
+    _term_write($"\x1B[?{code}h\x1B[?1006h".bytes());
+    return true;
+}
+
+# Turns mouse reporting off. Async-signal-safe: a signal handler calls it.
+[Target(OS(Linux) || OS(Mac))]
+_term_mouse_off() {
+    if (_term_mouse.exchange(false)) {
+        write(1, _term_mouse_off_bytes, _MOUSE_OFF.size);
+    }
+}
+
+[Target(OS(Linux) || OS(Mac))]
+_term_write(bytes: u8[]) {
+    __ptr<u8> buffer = malloc(bytes.count);
+    for (var index in 0..bytes.count) {
+        buffer[index] = bytes[index];
+    }
+    write(1, buffer, bytes.count);
+    free(buffer);
+}
+
 # Reads what standard input has, waiting at most `timeout` milliseconds
 # (-1: as long as it takes): the bytes appended, 0 when the time ran out,
 # or -1 at the end of input or on an error.
@@ -136,13 +182,13 @@ _copy(target: __ptr<void>, source: __ptr<void>, size: ulong) {
     }
 }
 
-# Restores the terminal when the program ends: at exit, and on the signals
+# Restores the terminal (raw mode and mouse reporting) when the program ends: at exit, and on the signals
 # that end it, a panic's SIGABRT (from `abort`) included. A signal the
 # program already handles keeps its handler: the program's own shutdown
 # then restores the terminal at exit.
 [Target(OS(Linux) || OS(Mac))]
 _term_install_hooks() {
-    var at_exit: extern () => void = _term_restore;
+    var at_exit: extern () => void = _term_restore_all;
     atexit(at_exit);
     var handler: extern (int) => void = _term_on_signal;
     # SIGHUP, SIGINT, SIGQUIT, SIGABRT, SIGTERM.
@@ -155,8 +201,14 @@ _term_install_hooks() {
 }
 
 [Target(OS(Linux) || OS(Mac))]
-_term_on_signal(number: int) {
+_term_restore_all() {
+    _term_mouse_off();
     _term_restore();
+}
+
+[Target(OS(Linux) || OS(Mac))]
+_term_on_signal(number: int) {
+    _term_restore_all();
     # The default action, once this handler returns and the signal is
     # unblocked.
     signal(number, __null);

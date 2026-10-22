@@ -1,8 +1,11 @@
-## Keys: `Key`, `KeyEvent`, and `KeyDecoder`, which turns the bytes a
-## terminal sends in raw mode into key events. Decoding is pure: bytes in,
-## events out, so it needs no terminal and works on bytes from anywhere.
+## Keys and the events beside them: `Key`, `KeyEvent`, `Event`, and the
+## decoders `KeyDecoder` and `InputDecoder`, which turn the bytes a terminal
+## sends in raw mode into key events, and mouse reports too. Decoding is
+## pure: bytes in, events out, so it needs no terminal and works on bytes
+## from anywhere.
 
 import text;
+import "mouse";
 
 ## Which key a `KeyEvent` is.
 export enum Key {
@@ -38,8 +41,8 @@ export enum Key {
     Delete,
     ## A function key; the event's `number` says which, 1 to 12.
     Function,
-    ## An escape sequence the decoder does not know, such as a mouse
-    ## report; programs usually ignore it.
+    ## An escape sequence the decoder does not know, or a mouse report read
+    ## as a key (see `InputDecoder`); programs usually ignore it.
     Unknown,
 }
 
@@ -117,25 +120,38 @@ export struct KeyEvent {
 
 const ESCAPE: u8 = 27;
 
-## Decodes the bytes a terminal sends in raw mode into `KeyEvent`s: UTF-8
-## characters, control characters, and the escape sequences of xterm and
-## its kin (VT100, the Linux console, Windows' virtual terminal input) for
-## the arrows, Home, End, Insert, Delete, Page Up and Down, and F1 to F12,
-## with their modifiers.
+## One thing the user did, as `InputDecoder` and `InputReader` give it: a
+## key press or a mouse report.
+[Value]
+export enum Event {
+    ## A key press.
+    Key(key: KeyEvent),
+    ## A mouse report, which arrives only while a `MouseMode` is on.
+    Mouse(mouse: MouseEvent),
+}
+
+## Decodes the bytes a terminal sends in raw mode into `Event`s: key
+## presses (see `KeyDecoder`) and mouse reports, in xterm's SGR encoding
+## (`ESC [ < b ; x ; y M`, or `m` for a release) and its older X10 one
+## (`ESC [ M` and three bytes).
 ##
 ## Feed it bytes as they arrive. A sequence split across reads is held
-## until the rest comes. A lone Escape looks like the start of a sequence,
-## so it is held too: when no more bytes arrive soon (a few tens of
-## milliseconds), call `flush` to decode it as the Escape key.
+## until the rest comes, and a lone Escape is held until `flush`, as with
+## `KeyDecoder`. A mouse report the decoder cannot read (a button past the
+## third, a position of 0, a broken sequence) decodes as `Key.Unknown`;
+## huge numbers are capped, never overflow.
 ##
 ## @example
 ##     import term;
+##     import [Event, MouseKind] from term;
 ##
-##     var decoder = term.KeyDecoder();
-##     var events = decoder.feed("\x1B[1;5Ax".bytes());
-##     assert(events[0].to_string() == "Ctrl+Up", "an arrow with Ctrl");
-##     assert(events[1].text == "x", "a character");
-export struct KeyDecoder {
+##     var decoder = term.InputDecoder();
+##     var events = decoder.feed("\x1B[<0;3;4Mx".bytes());
+##     match (events[0]) {
+##         Mouse(mouse) => assert(mouse.kind == MouseKind.Down && mouse.column == 2, "a click"),
+##         Key(key) => panic("a mouse report"),
+##     }
+export struct InputDecoder {
     var _pending = Array<u8>();
     # Whether the last byte decoded was a carriage return, so a line feed
     # right after it ends the same line rather than another.
@@ -149,12 +165,12 @@ export struct KeyDecoder {
         }
     }
 
-    ## Adds `bytes` and returns the key events they complete, in order.
-    ## Bytes that may begin a longer sequence are held for the next call.
+    ## Adds `bytes` and returns the events they complete, in order. Bytes
+    ## that may begin a longer sequence are held for the next call.
     ##
     ## @param bytes the bytes the terminal sent
     ## @returns the events, possibly none
-    feed(bytes: u8[]): KeyEvent[] {
+    feed(bytes: u8[]): Event[] {
         _pending.append_all(bytes);
         return _drain(false);
     }
@@ -164,12 +180,12 @@ export struct KeyDecoder {
     ## it, and an incomplete UTF-8 character is U+FFFD.
     ##
     ## @returns the events, possibly none
-    flush(): KeyEvent[] {
+    flush(): Event[] {
         return _drain(true);
     }
 
-    _drain(final: bool): KeyEvent[] {
-        var events = Array<KeyEvent>();
+    _drain(final: bool): Event[] {
+        var events = Array<Event>();
         ulong start = 0;
         while (start < _pending.count) {
             var (size, event) = _decode(start, final);
@@ -187,23 +203,29 @@ export struct KeyDecoder {
         return events;
     }
 
-    # Decodes the key whose bytes start at `start`: the number of bytes it
-    # takes and the event, or 0 when more bytes are needed to tell.
-    _decode(start: ulong, final: bool): (ulong, KeyEvent) {
-        var first = _pending[start];
-        if (first == ESCAPE) {
+    # Decodes the event whose bytes start at `start`: the number of bytes
+    # it takes and the event, or 0 when more bytes are needed to tell.
+    _decode(start: ulong, final: bool): (ulong, Event) {
+        if (_pending[start] == ESCAPE) {
             return _decode_escape(start, final);
         }
+        var (size, key) = _decode_key(start, final);
+        return (size, Event.Key(key));
+    }
+
+    # Decodes a key that is not an escape sequence.
+    _decode_key(start: ulong, final: bool): (ulong, KeyEvent) {
+        var first = _pending[start];
         if (first >= 128) {
             return _decode_utf8(start, final);
         }
         return (1, _control_or_char(first));
     }
 
-    _decode_escape(start: ulong, final: bool): (ulong, KeyEvent) {
-        var unknown = KeyEvent(Key.Unknown);
+    _decode_escape(start: ulong, final: bool): (ulong, Event) {
+        var unknown = Event.Key(KeyEvent(Key.Unknown));
         if (start + 1 == _pending.count) {
-            return final ? (1, KeyEvent(Key.Escape)) : (0, unknown);
+            return final ? (1, Event.Key(KeyEvent(Key.Escape))) : (0, unknown);
         }
         var second = _pending[start + 1];
         if (second == '[' || second == 'O') {
@@ -218,20 +240,22 @@ export struct KeyDecoder {
             # "Escape [" with nothing after it: Alt with '['.
         }
         if (second == ESCAPE) {
-            return (1, KeyEvent(Key.Escape));
+            return (1, Event.Key(KeyEvent(Key.Escape)));
         }
         # Escape then a key: that key with Alt.
-        var (size, event) = _decode(start + 1, final);
+        var (size, key) = _decode_key(start + 1, final);
         if (size == 0) {
             return (0, unknown);
         }
-        return (size + 1, event._with_alt());
+        return (size + 1, Event.Key(key._with_alt()));
     }
 
     # Decodes a CSI sequence ("Escape [", `ss3` false) or an SS3 one
     # ("Escape O"), whose parameters start at `start`: the bytes after the
     # introducer it takes, or none when it is not complete yet.
-    _decode_sequence(start: ulong, ss3: bool): (ulong, KeyEvent)? {
+    _decode_sequence(start: ulong, ss3: bool): (ulong, Event)? {
+        # SGR mouse reports start their parameters with '<'.
+        var sgr = !ss3 && start < _pending.count && _pending[start] == '<';
         var parameters = Array<int>();
         var current = 0;
         var has_digits = false;
@@ -239,7 +263,7 @@ export struct KeyDecoder {
         while (index < _pending.count) {
             var c = _pending[index];
             if (c >= '0' && c <= '9') {
-                # Past any real key's number: stop growing, so it cannot overflow.
+                # Past any real key's number or position: stop growing, so it cannot overflow.
                 if (current < 100000) {
                     current = current * 10 + (c - '0') as int;
                 }
@@ -252,15 +276,35 @@ export struct KeyDecoder {
                 if (has_digits || parameters.count > 0) {
                     parameters.append(current);
                 }
-                return Optional<(ulong, KeyEvent)>.Value((index - start + 1, _sequence_key(c, parameters, ss3)));
+                var size = index - start + 1;
+                if (sgr) {
+                    var mouse = Optional<MouseEvent>.Empty;
+                    if ((c == 'M' || c == 'm') && parameters.count == 3) {
+                        mouse = _mouse_from_code(parameters[0], parameters[1], parameters[2], c == 'm');
+                    }
+                    return Optional<(ulong, Event)>.Value((size, _mouse_or_unknown(mouse)));
+                }
+                if (c == 'M' && !ss3 && index == start) {
+                    # X10: the button code, column and row follow as bytes, each plus 32.
+                    if (index + 3 >= _pending.count) {
+                        return Optional<(ulong, Event)>.Empty;
+                    }
+                    var b = _pending[index + 1] as int - 32;
+                    var x = _pending[index + 2] as int - 32;
+                    var y = _pending[index + 3] as int - 32;
+                    return Optional<(ulong, Event)>.Value(
+                        (size + 3, _mouse_or_unknown(_mouse_from_code(b, x, y, false)))
+                    );
+                }
+                return Optional<(ulong, Event)>.Value((size, Event.Key(_sequence_key(c, parameters, ss3))));
             } else if (c < 32 || c > 63) {
                 # Not a parameter byte: a broken sequence. Take what came
                 # before it, which may be nothing.
-                return Optional<(ulong, KeyEvent)>.Value((index - start, KeyEvent(Key.Unknown)));
+                return Optional<(ulong, Event)>.Value((index - start, Event.Key(KeyEvent(Key.Unknown))));
             }
             index += 1;
         }
-        return Optional<(ulong, KeyEvent)>.Empty;
+        return Optional<(ulong, Event)>.Empty;
     }
 
     _decode_utf8(start: ulong, final: bool): (ulong, KeyEvent) {
@@ -279,6 +323,72 @@ export struct KeyDecoder {
         var bytes = _pending.slice(start, start + taken).to_array();
         return (taken, KeyEvent(Key.Char, text.Utf8.decode_lossy(bytes)));
     }
+}
+
+_mouse_or_unknown(mouse: MouseEvent?): Event {
+    return mouse.is_empty() ? Event.Key(KeyEvent(Key.Unknown)) : Event.Mouse(mouse.value());
+}
+
+# The key `event` is, for the readers of keys alone: a mouse report is
+# `Key.Unknown`, as it was before mouse reports were decoded.
+_key_of(event: Event): KeyEvent {
+    return match (event) {
+        Key(key) => key,
+        Mouse(mouse) => KeyEvent(Key.Unknown),
+    };
+}
+
+## Decodes the bytes a terminal sends in raw mode into `KeyEvent`s: UTF-8
+## characters, control characters, and the escape sequences of xterm and
+## its kin (VT100, the Linux console, Windows' virtual terminal input) for
+## the arrows, Home, End, Insert, Delete, Page Up and Down, and F1 to F12,
+## with their modifiers. A mouse report is one `Key.Unknown`; use
+## `InputDecoder` to read it.
+##
+## Feed it bytes as they arrive. A sequence split across reads is held
+## until the rest comes. A lone Escape looks like the start of a sequence,
+## so it is held too: when no more bytes arrive soon (a few tens of
+## milliseconds), call `flush` to decode it as the Escape key.
+##
+## @example
+##     import term;
+##
+##     var decoder = term.KeyDecoder();
+##     var events = decoder.feed("\x1B[1;5Ax".bytes());
+##     assert(events[0].to_string() == "Ctrl+Up", "an arrow with Ctrl");
+##     assert(events[1].text == "x", "a character");
+export struct KeyDecoder {
+    var _input = InputDecoder();
+
+    ## Whether bytes are held that may begin a longer sequence, so a caller
+    ## knows to wait briefly and then `flush`.
+    var has_pending: bool {
+        get {
+            return _input.has_pending;
+        }
+    }
+
+    ## Adds `bytes` and returns the key events they complete, in order.
+    ## Bytes that may begin a longer sequence are held for the next call.
+    ##
+    ## @param bytes the bytes the terminal sent
+    ## @returns the events, possibly none
+    feed(bytes: u8[]): KeyEvent[] {
+        return _keys(_input.feed(bytes));
+    }
+
+    ## Decodes the bytes held as they stand, since no more are coming: a
+    ## lone Escape is the Escape key, Escape before a character is Alt with
+    ## it, and an incomplete UTF-8 character is U+FFFD.
+    ##
+    ## @returns the events, possibly none
+    flush(): KeyEvent[] {
+        return _keys(_input.flush());
+    }
+}
+
+_keys(events: Event[]): KeyEvent[] {
+    return events.iterate().map((event) => _key_of(event)).to_array();
 }
 
 # The key a single byte below 128 is.

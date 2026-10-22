@@ -1,8 +1,8 @@
-## Interactive terminal programs: raw mode, key input, line editing with
-## history, cursor control, and 16, 256 and true colors, on Linux, macOS
-## (termios) and Windows (the Console API).
+## Interactive terminal programs: raw mode, key and mouse input, line
+## editing with history, cursor control, and 16, 256 and true colors, on
+## Linux, macOS (termios) and Windows (the Console API).
 ##
-## Bring it in with `import term`. Decoding keys (`KeyDecoder`) and
+## Bring it in with `import term`. Decoding input (`InputDecoder`) and
 ## editing lines (`LineEditor`) are pure, bytes in and events or text out,
 ## so they work and test without a terminal. Without one (input or output
 ## a pipe or a file), raw mode does nothing, lines are read plainly, and
@@ -11,6 +11,10 @@
 ## - `RawMode`, `restore`: raw mode on and off; the terminal is restored at
 ##   exit and on a panic too
 ## - `KeyReader`, `KeyDecoder`, `KeyEvent`, `Key`: key presses
+## - `MouseMode`, `MouseTracking`: mouse reporting on and off (it is off
+##   unless a program turns it on)
+## - `InputReader`, `InputDecoder`, `Event`, `MouseEvent`, `MouseKind`,
+##   `MouseButton`: key presses and mouse reports together
 ## - `LineReader`, `LineInput`, `LineEditor`, `EditStatus`, `History`:
 ##   readline-style line editing
 ## - `Style`, `Color`, `BasicColor`, `RESET`, `colors_enabled`: colors and
@@ -44,12 +48,19 @@
 
 import "keys";
 import "line";
+import "mouse";
 import "style";
 import "terminal";
 
 export Key;
 export KeyEvent;
 export KeyDecoder;
+export Event;
+export InputDecoder;
+export MouseKind;
+export MouseButton;
+export MouseEvent;
+export _mouse_from_record;
 export History;
 export EditStatus;
 export LineEditor;
@@ -81,5 +92,8 @@ export colors_enabled;
 export RawMode;
 export restore;
 export KeyReader;
+export InputReader;
+export MouseTracking;
+export MouseMode;
 export LineInput;
 export LineReader;
