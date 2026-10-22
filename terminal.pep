@@ -1,8 +1,8 @@
 ## The terminal itself: whether the standard streams are one, its size,
-## raw mode, mouse reporting, and reading keys, mouse reports and edited
-## lines from it. Each part degrades when there is no terminal (input from
-## a pipe or a file, output to one): raw mode and mouse reporting do
-## nothing, keys are decoded from the bytes as they come,
+## raw mode, mouse reporting, bracketed paste, and reading keys, mouse
+## reports, pastes and edited lines from it. Each part degrades when there
+## is no terminal (input from a pipe or a file, output to one): raw mode,
+## mouse reporting and bracketed paste do nothing, keys are decoded from the bytes as they come,
 ## lines are read plainly, and `colors_enabled` is false.
 
 import io;
@@ -198,6 +198,7 @@ export enum MouseTracking {
 ##                     match (event.value()) {
 ##                         Key(key) => print($"key {key}\r"),
 ##                         Mouse(click) => print($"mouse {click}\r"),
+##                         Paste(text, truncated) => print($"paste {text}\r"),
 ##                     }
 ##                 }
 ##             }
@@ -254,21 +255,102 @@ _mouse_mode_code(tracking: MouseTracking): int {
     };
 }
 
-## Turns raw mode and mouse reporting off now, wherever they were turned
-## on: for a program about to end with `process.exit`, which runs no exit
-## handlers. Does nothing when both are off.
+## Bracketed paste: while it is on, the terminal marks the start and end
+## of text pasted into it, so `InputReader` reads each paste whole, as one
+## `Event.Paste`, rather than as typed keys, and a paste with line ends
+## does not run as one command per line. Making a `PasteMode` turns it on;
+## `exit`, or the last reference going away, turns it off again. It is off
+## unless a program asks.
+##
+## Use it in a `with` block. Like raw mode it is turned off when the
+## program ends while it is on: at the end of `main`, on a panic, and on
+## SIGTERM, SIGHUP, SIGINT or SIGQUIT (POSIX); call `restore()` before
+## `process.exit`.
+##
+## It asks for xterm's bracketed paste (mode 2004), which current
+## terminals on Linux and macOS, and Windows Terminal, have. A terminal
+## without it ignores the request, and its pastes arrive as typed keys, as
+## they do in the older Windows console. On Windows it turns on the
+## console's reading of escape sequences, which the request needs.
+##
+## Without a terminal on standard input and output it does nothing, and
+## `active` is false. Bracketed paste is one setting of the whole
+## terminal, so while one `PasteMode` has it on, another is not `active`.
+##
+## @example
+##     import term;
+##     import [LineInput] from term;
+##
+##     main(): int {
+##         with (var paste = term.PasteMode()) {
+##             var reader = term.LineReader();
+##             match (reader.read_line("> ")) {
+##                 Line(text) => print($"read {text}"),
+##                 Interrupted => {}
+##                 EndOfInput => {}
+##             }
+##         }
+##         return 0;
+##     }
+export struct PasteMode {
+    var _active: bool;
+
+    ## Turns bracketed paste on, when standard input and output are a
+    ## terminal and it is not on already.
+    construct() {
+        _active = _term_paste_on();
+    }
+
+    destruct {
+        exit();
+    }
+
+    ## Whether this `PasteMode` turned bracketed paste on, and will turn it
+    ## off.
+    var active: bool {
+        get {
+            return _active;
+        }
+    }
+
+    ## Returns this `PasteMode`, for a `with` block.
+    ##
+    ## @returns this
+    enter(): PasteMode {
+        return this;
+    }
+
+    ## Turns bracketed paste off, if this `PasteMode` turned it on. Later
+    ## calls do nothing.
+    exit() {
+        if (_active) {
+            _active = false;
+            _term_paste_off();
+        }
+    }
+}
+
+extend PasteMode with Scoped<PasteMode>;
+
+## Turns raw mode, mouse reporting and bracketed paste off now, wherever
+## they were turned on: for a program about to end with `process.exit`,
+## which runs no exit handlers. Does nothing when all are off.
 export restore() {
     # process.exit skips atexit handlers: pep-lang/pepper#73.
-    _term_mouse_off();
-    _term_restore();
+    _term_restore_all();
 }
 
 # How long to wait, after bytes that may start an escape sequence, for the
 # rest of it before deciding they were the Escape key.
 const _ESCAPE_WAIT_MS = 50;
+# How long to wait for more of a paste whose end has not come, before
+# deciding it never will.
+const _PASTE_WAIT_MS = 1000;
 
-## Reads what the user does from standard input, key presses and, while a
-## `MouseMode` is on, mouse reports, decoding them with an `InputDecoder`.
+## Reads what the user does from standard input, decoding it with an
+## `InputDecoder`: key presses and, while a `MouseMode` or `PasteMode` is
+## on, mouse reports and pastes. A paste whose end does not come within a
+## second is given back as typed keys.
 ##
 ## On a terminal in raw mode, each key arrives as it is pressed. Outside
 ## raw mode the terminal sends nothing until Enter. Without a terminal,
@@ -286,7 +368,7 @@ export struct InputReader {
         _terminal = input_is_terminal();
     }
 
-    ## Waits for the next key press or mouse report.
+    ## Waits for the next key press, mouse report or paste.
     ##
     ## @returns the event, or none at the end of input
     read(): Event? {
@@ -304,7 +386,7 @@ export struct InputReader {
         _ready = Array<Event>();
         _next = 0;
         var bytes = Array<u8>();
-        var wait = _decoder.has_pending ? _ESCAPE_WAIT_MS : -1;
+        var wait = _decoder.pasting ? _PASTE_WAIT_MS : (_decoder.has_pending ? _ESCAPE_WAIT_MS : -1);
         long count = 0;
         if (_terminal) {
             count = _term_read(bytes, wait);
@@ -318,17 +400,20 @@ export struct InputReader {
             return;
         }
         _ready = count == 0 ? _decoder.flush() : _decoder.feed(bytes);
-        if (!_terminal && _decoder.has_pending) {
-            # A pipe cannot be waited on everywhere: what came is all there is.
+        if (!_terminal && _decoder.has_pending && !_decoder.pasting) {
+            # A pipe cannot be waited on everywhere: what came is all there
+            # is. A paste's end comes in a later read, or the pipe's does.
             _ready.append_all(_decoder.flush());
         }
     }
 }
 
 ## Reads key presses from standard input, as `InputReader` does; a mouse
-## report is `Key.Unknown`.
+## report is `Key.Unknown`, and a paste the keys its text types.
 export struct KeyReader {
     var _input = InputReader();
+    var _ready = Array<KeyEvent>();
+    var _next: ulong = 0;
 
     ## Makes a reader of standard input.
     construct() {}
@@ -337,11 +422,16 @@ export struct KeyReader {
     ##
     ## @returns the key, or none at the end of input
     read(): KeyEvent? {
-        var event = _input.read();
-        if (event.is_empty()) {
-            return Optional<KeyEvent>.Empty;
+        while (_next >= _ready.count) {
+            var event = _input.read();
+            if (event.is_empty()) {
+                return Optional<KeyEvent>.Empty;
+            }
+            _ready = _keys([event.value()]);
+            _next = 0;
         }
-        return Optional<KeyEvent>.Value(_key_of(event.value()));
+        _next += 1;
+        return Optional<KeyEvent>.Value(_ready[_next - 1]);
     }
 }
 
@@ -359,7 +449,9 @@ export enum LineInput {
 
 ## Reads lines from standard input for a REPL or a prompt, with editing and
 ## history (see `LineEditor` for the keys) when standard input and output
-## are a terminal, and plainly otherwise.
+## are a terminal, and plainly otherwise. While a `PasteMode` is on, a
+## paste goes into the line whole, line ends and all, without submitting
+## it.
 ##
 ## @example
 ##     import term;
@@ -382,7 +474,7 @@ export enum LineInput {
 export struct LineReader {
     ## The editor; its `history` holds the lines read so far.
     var editor: LineEditor;
-    var _keys = KeyReader();
+    var _input = InputReader();
     var _out = io.File.stdout();
     # Bytes read past the line returned, without a terminal.
     var _plain = Array<u8>();
@@ -414,12 +506,21 @@ export struct LineReader {
             editor.clear();
             _write(editor.render(prompt));
             while (true) {
-                var key = _keys.read();
-                if (key.is_empty()) {
+                var event = _input.read();
+                if (event.is_empty()) {
                     _write("\r\n");
                     return LineInput.EndOfInput;
                 }
-                var status = editor.handle(key.value());
+                var status = EditStatus.Editing;
+                match (event.value()) {
+                    Key(key) => {
+                        status = editor.handle(key);
+                    }
+                    Mouse(mouse) => {}
+                    Paste(pasted, truncated) => {
+                        editor.paste(pasted);
+                    }
+                }
                 var terminal = size();
                 var width = terminal.is_empty() ? 0 : terminal.value().columns;
                 _write(editor.render(prompt, width));

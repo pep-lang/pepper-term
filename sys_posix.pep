@@ -62,6 +62,13 @@ const _term_mouse = async.Atomic<bool>(false);
 const _MOUSE_OFF = "\x1B[?1006l\x1B[?1003l\x1B[?1002l\x1B[?1000l";
 [Target(OS(Linux) || OS(Mac))]
 const _term_mouse_off_bytes: __ptr<u8> = malloc(64);
+# The same for bracketed paste.
+[Target(OS(Linux) || OS(Mac))]
+const _term_paste = async.Atomic<bool>(false);
+[Target(OS(Linux) || OS(Mac))]
+const _PASTE_OFF = "\x1B[?2004l";
+[Target(OS(Linux) || OS(Mac))]
+const _term_paste_off_bytes: __ptr<u8> = malloc(16);
 
 [Target(OS(Linux) || OS(Mac))]
 _term_is_terminal(fd: int): bool {
@@ -112,24 +119,51 @@ _term_restore() {
 # or 1003), SGR-encoded: whether it did.
 [Target(OS(Linux) || OS(Mac))]
 _term_mouse_on(code: int): bool {
-    if (_term_mouse.load() || isatty(0) == 0 || isatty(1) == 0) {
-        return false;
-    }
-    _term_hooks.call(_term_install_hooks);
-    var off = _MOUSE_OFF.bytes();
-    for (var index in 0..off.count) {
-        _term_mouse_off_bytes[index] = off[index];
-    }
-    _term_mouse.store(true);
-    _term_write($"\x1B[?{code}h\x1B[?1006h".bytes());
-    return true;
+    return _term_mode_on(_term_mouse, $"\x1B[?{code}h\x1B[?1006h", _MOUSE_OFF, _term_mouse_off_bytes);
 }
 
 # Turns mouse reporting off. Async-signal-safe: a signal handler calls it.
 [Target(OS(Linux) || OS(Mac))]
 _term_mouse_off() {
-    if (_term_mouse.exchange(false)) {
-        write(1, _term_mouse_off_bytes, _MOUSE_OFF.size);
+    _term_mode_off(_term_mouse, _term_mouse_off_bytes, _MOUSE_OFF.size);
+}
+
+# Asks the terminal for bracketed paste: whether it did.
+[Target(OS(Linux) || OS(Mac))]
+_term_paste_on(): bool {
+    return _term_mode_on(_term_paste, "\x1B[?2004h", _PASTE_OFF, _term_paste_off_bytes);
+}
+
+# Turns bracketed paste off. Async-signal-safe: a signal handler calls it.
+[Target(OS(Linux) || OS(Mac))]
+_term_paste_off() {
+    _term_mode_off(_term_paste, _term_paste_off_bytes, _PASTE_OFF.size);
+}
+
+# Turns a terminal mode on by writing `on`, when standard input and output
+# are a terminal and `state` says it is off, first keeping `off`, which
+# turns it off again, in `off_bytes`: whether it did.
+[Target(OS(Linux) || OS(Mac))]
+_term_mode_on(state: async.Atomic<bool>, on: String, off: String, off_bytes: __ptr<u8>): bool {
+    if (state.load() || isatty(0) == 0 || isatty(1) == 0) {
+        return false;
+    }
+    _term_hooks.call(_term_install_hooks);
+    var bytes = off.bytes();
+    for (var index in 0..bytes.count) {
+        off_bytes[index] = bytes[index];
+    }
+    state.store(true);
+    _term_write(on.bytes());
+    return true;
+}
+
+# Turns a mode `_term_mode_on` turned on off, writing the `size` bytes it
+# kept. Async-signal-safe.
+[Target(OS(Linux) || OS(Mac))]
+_term_mode_off(state: async.Atomic<bool>, off_bytes: __ptr<u8>, size: ulong) {
+    if (state.exchange(false)) {
+        write(1, off_bytes, size);
     }
 }
 
@@ -182,10 +216,11 @@ _copy(target: __ptr<void>, source: __ptr<void>, size: ulong) {
     }
 }
 
-# Restores the terminal (raw mode and mouse reporting) when the program
-# ends: at exit, and on the signals that end it, a panic's SIGABRT (from
-# `abort`) included. A signal the program already handles keeps its
-# handler: the program's own shutdown then restores the terminal at exit.
+# Restores the terminal (raw mode, mouse reporting and bracketed paste)
+# when the program ends: at exit, and on the signals that end it, a
+# panic's SIGABRT (from `abort`) included. A signal the program already
+# handles keeps its handler: the program's own shutdown then restores the
+# terminal at exit.
 [Target(OS(Linux) || OS(Mac))]
 _term_install_hooks() {
     var at_exit: extern () => void = _term_restore_all;
@@ -203,6 +238,7 @@ _term_install_hooks() {
 [Target(OS(Linux) || OS(Mac))]
 _term_restore_all() {
     _term_mouse_off();
+    _term_paste_off();
     _term_restore();
 }
 

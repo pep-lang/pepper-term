@@ -1,10 +1,10 @@
 # pepper-term
 
 Interactive terminal programs for [Pepper](https://github.com/pep-lang/pepper):
-raw mode, key and mouse input, readline-style line editing with history,
-cursor control, and 16, 256 and true colors. It uses termios on Linux and macOS
-and the Console API on Windows, and restores the terminal however the
-program ends, a panic included.
+raw mode, key and mouse input, bracketed paste, readline-style line
+editing with history, cursor control, and 16, 256 and true colors. It uses
+termios on Linux and macOS and the Console API on Windows, and restores
+the terminal however the program ends, a panic included.
 
 One module, **`term`**:
 
@@ -18,12 +18,14 @@ One module, **`term`**:
   F1 to F12, Ctrl, Alt and Shift, UTF-8 characters), with no terminal.
 - **`MouseMode`** turns mouse reporting on for its lifetime (it is off
   unless a program asks), with **`MouseTracking`** saying which reports:
-  buttons, drags, or every move. **`InputReader`** and **`InputDecoder`**
-  read key presses and mouse reports together, as **`Event`**s:
-  `Event.Key(KeyEvent)` or `Event.Mouse(MouseEvent)`, a **`MouseEvent`**
-  holding its **`MouseKind`** (down, up, drag, moved, scroll up, down,
-  left or right), **`MouseButton`**, zero-based column and row, and
-  Ctrl, Alt and Shift.
+  buttons, drags, or every move. **`PasteMode`** turns bracketed paste
+  on the same way. **`InputReader`** and **`InputDecoder`** read key
+  presses, mouse reports and pastes together, as **`Event`**s:
+  `Event.Key(KeyEvent)`, `Event.Mouse(MouseEvent)`, or
+  `Event.Paste(text, truncated)`, a **`MouseEvent`** holding its
+  **`MouseKind`** (down, up, drag, moved, scroll up, down, left or
+  right), **`MouseButton`**, zero-based column and row, and Ctrl, Alt
+  and Shift.
 - **`Style`**, **`Color`** and **`BasicColor`** color and style text;
   **`colors_enabled()`** says whether to, following `NO_COLOR`.
 - **`move_to`**, `move_up`, `move_down`, `move_left`, `move_right`,
@@ -57,7 +59,8 @@ main(): int {
 ```
 
 This is `examples/repl/main.pep`; `examples/keys/main.pep` shows each key
-pressed in raw mode, and `examples/mouse/main.pep` each mouse report.
+pressed in raw mode, and `examples/events/main.pep` each key, mouse report
+and paste.
 
 Without a terminal (input or output a pipe or a file), everything still
 works: `RawMode` does nothing and is not `active`, `LineReader` reads lines
@@ -68,8 +71,8 @@ is false, so `paint` leaves text plain.
 
 Raw mode is turned off when the `RawMode` goes away (use it in a `with`
 block), at the end of `main`, on a panic, and, on Linux and macOS, on
-SIGTERM, SIGHUP, SIGINT and SIGQUIT. Mouse reporting is turned off on the
-same paths. `process.exit` ends the program without running exit
+SIGTERM, SIGHUP, SIGINT and SIGQUIT. Mouse reporting and bracketed paste
+are turned off on the same paths. `process.exit` ends the program without running exit
 handlers, so call `term.restore()` before it.
 
 ## Mouse input
@@ -81,19 +84,34 @@ the console's mouse input, and Quick Edit off while it is on, and the
 console's mouse records become the same events. Many terminals keep
 Shift+click for selecting text, so `shift` is rarely seen.
 
+## Bracketed paste
+
+`PasteMode` asks the terminal for bracketed paste (mode 2004): it marks
+where a paste starts and ends, so the decoder delivers it as one
+`Event.Paste`, its line ends as `"\n"`. A paste with line ends then cannot
+run as one command per line in a REPL. `LineReader` puts a paste into the
+line without submitting it, and Enter then submits the whole text.
+
+- A paste longer than the decoder's `paste_limit` (1 MiB unless set) keeps
+  its start and is marked `truncated`.
+- A paste whose end marker never comes is held for at most a second, then
+  given back as the keys it would have typed.
+- Windows Terminal supports bracketed paste with the same sequences. The
+  older Windows console host does not: it types a paste in as keys, as
+  `KeyReader` reads it without `PasteMode`.
+- `KeyDecoder` and `KeyReader` turn a paste back into the keys of its text.
+
 ## Limits
 
 - Each code point counts as one column: wide (CJK, emoji) and combining
   characters misplace the cursor in `LineEditor`.
 - A line wider than the terminal scrolls sideways; it does not wrap onto
   more rows.
-- No bracketed paste, resize notification (SIGWINCH), progress bars, or history saved to a
+- No resize notification (SIGWINCH), progress bars, or history saved to a
   file.
 - In raw mode on Linux and macOS, output is raw too: write `"\r\n"` for a
   new line.
-- On Windows, raw mode uses virtual terminal input (Windows 10 and later),
-  and an Escape key is told from an escape sequence by what one read
-  returns, without waiting.
+- On Windows, raw mode uses virtual terminal input (Windows 10 and later).
 
 ## Using it
 
@@ -121,12 +139,14 @@ this repository on the import path: `pepper build -I packages main.pep`.
 tests/run.sh path/to/pepper
 ```
 
-runs the `[Test]` functions in `tests/` with `pepper test` (key and mouse
-decoding, Windows mouse records, line editing and styles, which need no
-terminal), runs the examples on piped input, and on Linux and macOS runs
-`tests/restore/main.pep` on a pseudo-terminal (through `script`) to check
-the terminal's settings come back, and mouse reporting is turned off,
-after a return, a panic, SIGTERM, and a `RawMode` kept alive past `main`.
+runs the `[Test]` functions in `tests/` with `pepper test` (key, mouse and
+paste decoding, Windows mouse records, line editing and styles, which
+need no terminal, and, on Windows, reading records written into a real
+console), runs the examples on piped input, and on Linux and
+macOS runs `tests/restore/main.pep` on a pseudo-terminal (through
+`script`). That checks the terminal's settings come back, and mouse
+reporting and bracketed paste are turned off, after a return, a panic,
+SIGTERM, and a `RawMode` kept alive past `main`.
 
 ## Releasing
 

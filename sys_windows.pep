@@ -5,6 +5,8 @@
 ## the same escape sequences a POSIX terminal does, and `KeyDecoder` reads
 ## both. Mouse reporting reads the console's input records instead, and
 ## turns its mouse records into the SGR reports a POSIX terminal sends.
+## Bracketed paste is asked for with the same sequence as on POSIX, which
+## Windows Terminal answers; the older console host types pastes as keys.
 
 import async;
 import text;
@@ -23,7 +25,13 @@ extern int ReadConsoleW(void* console, void* buffer, uint count, uint* read, voi
 [Target(OS(Windows))]
 extern int ReadConsoleInputW(void* console, void* records, uint count, uint* read);
 [Target(OS(Windows))]
+extern int PeekConsoleInputW(void* console, void* records, uint count, uint* read);
+[Target(OS(Windows))]
+extern int WriteFile(void* file, void* buffer, uint size, uint* written, void* overlapped);
+[Target(OS(Windows))]
 extern uint WaitForSingleObject(void* handle, uint milliseconds);
+[Target(OS(Windows))]
+extern ulong GetTickCount64();
 [Target(OS(Windows))]
 extern void* signal(int number, void* handler);
 [Target(OS(Windows))]
@@ -82,6 +90,9 @@ const _term_mouse = async.Atomic<int>(0);
 const _term_mouse_quick_edit = async.Atomic<bool>(false);
 [Target(OS(Windows))]
 const _term_mouse_buttons = async.Atomic<uint>(0);
+# Whether bracketed paste is on.
+[Target(OS(Windows))]
+const _term_paste = async.Atomic<bool>(false);
 
 [Target(OS(Windows))]
 _term_handle(fd: int): __ptr<void> {
@@ -200,23 +211,54 @@ _term_mouse_off() {
     }
 }
 
+# Asks the console for bracketed paste, which Windows Terminal answers by
+# marking pastes the way a POSIX terminal does; the older console host
+# ignores it, and its pastes stay typed keys. Whether it asked.
+[Target(OS(Windows))]
+_term_paste_on(): bool {
+    if (_term_paste.load() || !_term_is_terminal(0) || !_term_enable_sequences()) {
+        return false;
+    }
+    _term_hooks.call(_term_install_hooks);
+    _term_paste.store(true);
+    _term_write("\x1B[?2004h");
+    return true;
+}
+
+[Target(OS(Windows))]
+_term_paste_off() {
+    # Raw mode's restore may have turned sequences off since.
+    if (_term_paste.exchange(false) && _term_enable_sequences()) {
+        _term_write("\x1B[?2004l");
+    }
+}
+
+[Target(OS(Windows))]
+_term_write(sequence: String) {
+    var bytes = sequence.bytes();
+    __ptr<u8> buffer = malloc(bytes.count);
+    for (var index in 0..bytes.count) {
+        buffer[index] = bytes[index];
+    }
+    __ptr<uint> written = malloc(4);
+    WriteFile(_term_handle(1), buffer, bytes.count as uint, written, __null);
+    free(written);
+    free(buffer);
+}
+
 # Reads what the console has, waiting at most `timeout` milliseconds (-1:
 # as long as it takes): the bytes appended, as UTF-8, 0 when the time ran
 # out, or -1 on an error.
 [Target(OS(Windows))]
 _term_read(buffer: u8[], timeout: int): long {
-    # shortcut: the console puts a key's whole escape sequence in its input
-    # buffer at once, so after a read nothing more is waited for, and a
-    # read that ends in Escape is the Escape key. Wait on the handle if a
-    # console turns out to split them.
-    if (timeout >= 0) {
+    var tracking = _term_mouse.load();
+    var handle = _term_handle(0);
+    if (timeout >= 0 && !_term_wait(handle, timeout, tracking != 0)) {
         return 0;
     }
-    var tracking = _term_mouse.load();
     if (tracking != 0) {
         return _term_read_records(buffer, tracking);
     }
-    var handle = _term_handle(0);
     __ptr<u8> units = malloc(2048);
     __ptr<uint> count = malloc(4);
     count[0] = 0;
@@ -265,9 +307,7 @@ _term_read_records(buffer: u8[], tracking: int): long {
         var (left, top, right, bottom) = _term_window();
         for (var index in 0..(ok ? count[0] as ulong : 0)) {
             var at = index * 10;
-            # Alt+numpad typing gives its character when Alt (VK_MENU, 18) is released.
-            var typed = words[at / 2 + 1] != 0 || records[at + 5] == 18;
-            if (records[at] == 1 && typed && records[at + 7] != 0) {
+            if (_term_record_types(records, at)) {
                 # KEY_EVENT: bKeyDown, wRepeatCount, wVirtualKeyCode, then UnicodeChar.
                 for (var repeat in 0..(records[at + 4] > 0 ? records[at + 4] as ulong : 1)) {
                     utf16.append((records[at + 7] & 255) as u8);
@@ -303,6 +343,62 @@ _term_read_records(buffer: u8[], tracking: int): long {
     return ok ? (buffer.count - start) as long : -1;
 }
 
+# Whether the input record at ushort `at` of `records` is a key record that
+# types a character: a press, or the release of Alt (VK_MENU, 18) that
+# ends Alt+numpad typing.
+[Target(OS(Windows))]
+_term_record_types(records: __ptr<ushort>, at: ulong): bool {
+    __ptr<uint> words = unsafe_cast<__ptr<uint>>(records);
+    var typed = words[at / 2 + 1] != 0 || records[at + 5] == 18;
+    return records[at] == 1 && typed && records[at + 7] != 0;
+}
+
+# Waits at most `timeout` milliseconds for input a read gives something
+# for: a key record that types, or, with mouse input on, a mouse record
+# that reports. Other records (key releases, focus, moves not asked for)
+# would wake the wait and then block the read, so they are dropped, as
+# ReadConsoleW drops them anyway. Whether such input came.
+[Target(OS(Windows))]
+_term_wait(handle: __ptr<void>, timeout: int, mouse: bool): bool {
+    var deadline = GetTickCount64() + timeout as ulong;
+    __ptr<ushort> record = malloc(20);
+    __ptr<uint> count = malloc(4);
+    var ready = false;
+    while (!ready) {
+        var now = GetTickCount64();
+        var left = deadline > now ? deadline - now : 0;
+        count[0] = 0;
+        if (WaitForSingleObject(handle, left as uint) != 0
+            || PeekConsoleInputW(handle, record, 1, count) == 0
+            || count[0] == 0) {
+            break;
+        }
+        ready = _term_record_types(record, 0) || (mouse && record[0] == 2 && _term_record_reports(record));
+        if (!ready) {
+            ReadConsoleInputW(handle, record, 1, count);
+        }
+    }
+    free(record);
+    free(count);
+    return ready;
+}
+
+# Whether the mouse record `record` reports something the mouse mode asked
+# for; one that does not is dropped, so its button state is kept here.
+[Target(OS(Windows))]
+_term_record_reports(record: __ptr<ushort>): bool {
+    __ptr<uint> words = unsafe_cast<__ptr<uint>>(record);
+    var buttons = words[2];
+    var reports = _mouse_from_record(
+        buttons, _term_mouse_buttons.load(), words[3], words[4], 0, 0, _term_mouse.load()
+    ).count
+        > 0;
+    if (!reports) {
+        _term_mouse_buttons.store(buttons);
+    }
+    return reports;
+}
+
 # Turns on the console's reading of ANSI escape sequences, which Windows
 # Terminal has on already and the older console host does not.
 [Target(OS(Windows))]
@@ -333,6 +429,7 @@ _term_install_hooks() {
 [Target(OS(Windows))]
 _term_restore_all() {
     _term_mouse_off();
+    _term_paste_off();
     _term_restore();
 }
 

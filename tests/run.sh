@@ -20,7 +20,7 @@ mkdir "$build/packages"
 ln -s "$root" "$build/packages/term"
 "$pepper" test -I "$build/packages" "$root/tests"
 
-for program in repl keys mouse; do
+for program in repl keys events; do
     "$pepper" build -I "$build/packages" "$root/examples/$program/main.pep" -o "$build/$program"
 done
 "$pepper" build -I "$build/packages" "$root/tests/restore/main.pep" -o "$build/restore"
@@ -36,8 +36,12 @@ expect() {
 expect "$(printf 'one\r\ntwo\n\nlast' | "$build/repl" | tr -d '\r')" \
     "$(printf '> you typed one\n> you typed two\n> you typed \n> you typed last\n> 3 lines')"
 expect "$(printf 'a\033[A\033[1;5C\303\251\tq' | "$build/keys" | tr -d '\r')" "$(printf 'a\nUp\nCtrl+Right\n\303\251\nTab')"
-expect "$(printf '\033[<0;3;4M\033[<64;1;1Mxq' | "$build/mouse" | tr -d '\r')" \
+expect "$(printf '\033[<0;3;4M\033[<64;1;1Mxq' | "$build/events" | tr -d '\r')" \
     "$(printf 'mouse Left Down at 2,3\nmouse ScrollUp at 0,0\nkey x')"
+# A paste is one event, line ends and all, even across the pipe's reads.
+expect "$(printf '\033[200~a\rb\033[201~q' | "$build/events" | tr -d '\r')" 'paste of 3 bytes: a\nb'
+big="$(head -c 5000 /dev/zero | tr '\0' x)"
+expect "$(printf '\033[200~%s\033[201~q' "$big" | "$build/events" | tr -d '\r')" "paste of 5000 bytes: $big"
 
 case "$(uname -s)" in
     Linux) on_terminal() { script -qec "$1" /dev/null; } ;;
@@ -62,15 +66,19 @@ for how in return panic signal forget; do
     }
 done
 
-# With mouse reporting on too: its sequences go to the terminal, which
-# `script` copies out, so the last mouse sequence written must turn
-# reporting off.
-for how in return panic signal forget; do
-    on_terminal "'$build/restore' $how mouse" < /dev/null > "$build/typescript" 2>&1 || true
-    grep -q 'mouse on' "$build/typescript" || { cat -v "$build/typescript" >&2; echo "error: $how: mouse reporting did not turn on" >&2; exit 1; }
-    after="$(cat "$build/typescript")"
-    case "${after##*$'\e[?1006h'}" in
-        *$'\e[?1006l\e[?1003l\e[?1002l\e[?1000l'*) ;;
-        *) cat -v "$build/typescript" >&2; echo "error: $how left mouse reporting on" >&2; exit 1 ;;
+# With mouse reporting and bracketed paste on too: their sequences go to
+# the terminal, which `script` copies out, so after the last sequence that
+# turns each on must come the one that turns it off.
+turned_off() {
+    case "${2##*"$3"}" in
+        *"$4"*) ;;
+        *) cat -v "$build/typescript" >&2; echo "error: $1 left $5 on" >&2; exit 1 ;;
     esac
+}
+for how in return panic signal forget; do
+    on_terminal "'$build/restore' $how modes" < /dev/null > "$build/typescript" 2>&1 || true
+    grep -q 'modes on' "$build/typescript" || { cat -v "$build/typescript" >&2; echo "error: $how: the modes did not turn on" >&2; exit 1; }
+    after="$(cat "$build/typescript")"
+    turned_off "$how" "$after" $'\e[?1006h' $'\e[?1006l\e[?1003l\e[?1002l\e[?1000l' "mouse reporting"
+    turned_off "$how" "$after" $'\e[?2004h' $'\e[?2004l' "bracketed paste"
 done

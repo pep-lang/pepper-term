@@ -167,12 +167,26 @@ export struct LineEditor {
         return EditStatus.Editing;
     }
 
+    ## Inserts `text` at the cursor, as `Event.Paste` gives it: line ends
+    ## and all, without submitting the line, and without touching the
+    ## history.
+    ##
+    ## @param text the text pasted
+    paste(text: String) {
+        for (var c in text) {
+            _characters.insert(_cursor, c);
+            _cursor += 1;
+        }
+    }
+
     ## Returns the bytes that redraw the line on the terminal row the cursor
     ## is on: a carriage return, `prompt`, the text, an erase to the end of
     ## the row, and the move back to the cursor.
     ##
     ## A line wider than `width` columns scrolls sideways to keep the cursor
-    ## in view. Each code point counts as one column.
+    ## in view. Each code point counts as one column. A line end (from a
+    ## paste) shows as "⏎", and another control character as "\u{FFFD}", so
+    ## pasted text cannot move the cursor or send the terminal sequences.
     ##
     ## @param prompt the text shown before the line
     ## @param width the terminal's width in columns; 0 when unknown, which
@@ -190,7 +204,7 @@ export struct LineEditor {
             first = _cursor > room ? _cursor - room : 0;
             last = first + room < _characters.count ? first + room : _characters.count;
         }
-        var shown = "".join(_characters.slice(first, last).to_array());
+        var shown = "".join(_characters.slice(first, last).iterate().map((c) => _shown(c)).to_array());
         var out = $"\r{prompt}{shown}\x1B[K";
         var back = last - _cursor;
         if (back > 0) {
@@ -263,6 +277,18 @@ export struct LineEditor {
         _recalled = step < 0 ? _recalled - 1 : _recalled + 1;
         _set(_recalled == count ? _draft : history.entries[_recalled]);
     }
+}
+
+# How the line's character `c` shows: control characters, which only a
+# paste puts in, as one harmless column.
+_shown(c: String): String {
+    var byte = c.byte_at(0);
+    if (byte == '\n') {
+        return "⏎";
+    }
+    # C0, DEL, and C1 (U+0080 to U+009F, which some terminals obey too).
+    var control = byte < 32 || byte == 127 || (byte == 194 && c.byte_at(1) < 160);
+    return control ? "\u{FFFD}" : c;
 }
 
 # The columns `text` takes on screen: its code points, without the CSI
