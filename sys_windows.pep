@@ -494,9 +494,10 @@ _term_clipboard_open(): String? {
     return Optional<String>.Value($"OpenClipboard failed (error {GetLastError()})");
 }
 
-# Puts `copied` on the clipboard as CF_UNICODETEXT, in place of what it held.
+# Puts `copied` on the clipboard as CF_UNICODETEXT, in place of what it
+# held. `tool` is what `_term_clipboard_tool` gave, as on POSIX.
 [Target(OS(Windows))]
-_term_clipboard_copy(copied: String): Result<void> {
+_term_clipboard_copy(tool: String, copied: String): Result<void> {
     var not_open = _term_clipboard_open();
     if (!not_open.is_empty()) {
         return Result<void>.err(Error(not_open.value()));
@@ -530,7 +531,7 @@ _term_clipboard_copy(copied: String): Result<void> {
 
 # The clipboard's text, empty when it holds none.
 [Target(OS(Windows))]
-_term_clipboard_read(): Result<String> {
+_term_clipboard_read(tool: String): Result<String> {
     var not_open = _term_clipboard_open();
     if (!not_open.is_empty()) {
         return Result<String>.err(Error(not_open.value()));

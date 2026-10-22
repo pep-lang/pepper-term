@@ -45,12 +45,13 @@ expect "$(printf '\033[200~a\rb\033[201~q' | "$build/events" | tr -d '\r')" 'pas
 big="$(head -c 5000 /dev/zero | tr '\0' x)"
 expect "$(printf '\033[200~%s\033[201~q' "$big" | "$build/events" | tr -d '\r')" "paste of 5000 bytes: $big"
 
-# The OS's clipboard, through its program: on Linux a fake wl-copy and
-# wl-paste on the PATH, which keep the text in a file; on macOS the real
-# pbcopy and pbpaste (Windows' is tested in tests/clipboard_test.pep).
+# The OS's clipboard: on Linux through a fake wl-copy and wl-paste on the
+# PATH, which keep the text in a file; on macOS through the real pbcopy and
+# pbpaste; on Windows its own, skipped (saying so) when it cannot be opened.
+# What the real clipboard held is put back after, and kept out of the log.
 clipboard_round_trip() {
-    expect "$(printf 'h\303\251llo\nworld' | "$@" "$build/clipboard" copy)" 'copied, through System'
-    expect "$("$@" "$build/clipboard" < /dev/null)" "$(printf 'read, through System: h\303\251llo\nworld')"
+    expect "$(printf 'h\303\251llo\nworld' | "$@" "$build/clipboard" copy | tr -d '\r')" 'copied, through System'
+    expect "$("$@" "$build/clipboard" < /dev/null | tr -d '\r')" "$(printf 'read, through System: h\303\251llo\nworld')"
 }
 case "$(uname -s)" in
     Linux)
@@ -65,9 +66,28 @@ case "$(uname -s)" in
             'could not read, through Osc52: no clipboard: standard input and output, which OSC 52 needs, are not a terminal'
         ;;
     Darwin)
+        { set +x; } 2> /dev/null
         saved="$(pbpaste)"
+        set -x
         clipboard_round_trip env
+        { set +x; } 2> /dev/null
         printf '%s' "$saved" | pbcopy
+        set -x
+        ;;
+    MINGW* | MSYS* | CYGWIN*)
+        { set +x; } 2> /dev/null
+        saved="$("$build/clipboard" < /dev/null || true)"
+        set -x
+        case "$saved" in
+            'read, through System: '*)
+                clipboard_round_trip env
+                { set +x; } 2> /dev/null
+                printf '%s' "${saved#read, through System: }" | "$build/clipboard" copy > /dev/null
+                set -x
+                ;;
+            *OpenClipboard*) echo "skipped the Windows clipboard: it cannot be opened here" ;;
+            *) echo "error: reading the Windows clipboard failed" >&2; exit 1 ;;
+        esac
         ;;
 esac
 

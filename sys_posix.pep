@@ -304,14 +304,16 @@ _term_clipboard_command(command: String[]): process.Command {
         .stderr(process.Stream.Null);
 }
 
-# Puts `copied` on the clipboard, through the clipboard's program.
+# SIGPIPE, and signal's SIG_IGN.
 [Target(OS(Linux) || OS(Mac))]
-_term_clipboard_copy(copied: String): Result<void> {
-    var tool = _term_clipboard_tool();
-    if (tool is Err(error)) {
-        return Result<void>.err(error);
-    }
-    var (copy, paste) = _term_clipboard_commands(tool.value());
+const _SIGPIPE = 13;
+[Target(OS(Linux) || OS(Mac))]
+const _SIG_IGN: ulong = 1;
+
+# Puts `copied` on the clipboard, through `tool`, from `_term_clipboard_tool`.
+[Target(OS(Linux) || OS(Mac))]
+_term_clipboard_copy(tool: String, copied: String): Result<void> {
+    var (copy, paste) = _term_clipboard_commands(tool);
     # wl-copy, xclip and xsel stay behind to serve the clipboard, holding
     # whatever streams they were given: a pipe for output would never end.
     var started = _term_clipboard_command(copy).stdin(process.Stream.Pipe).stdout(process.Stream.Null).spawn();
@@ -319,24 +321,27 @@ _term_clipboard_copy(copied: String): Result<void> {
         return Result<void>.err(Error($"could not start '{copy[0]}': {error.message}"));
     }
     var child = started.value();
-    child.stdin().write_all(copied);
+    # A program that ended without reading (xclip without a display) would
+    # raise SIGPIPE, which ends this one: ignore it while writing.
+    # shortcut: the setting is the whole process's, so another thread's
+    # pipe write meanwhile ignores it too; that only turns its kill into an
+    # error.
+    var previous = signal(_SIGPIPE, unsafe_cast<__ptr<void>>(_SIG_IGN));
+    var written = child.stdin().write_all(copied);
+    signal(_SIGPIPE, previous);
     child.stdin().close();
     var status = child.wait();
-    if (status.is_err() || !status.value().success()) {
+    if (status.is_err() || !status.value().success() || written.is_err()) {
         var how = status.is_err() ? "could not be waited for" : $"ended with {status.value()}";
-        return Result<void>.err(Error($"'{copy[0]}' {how}"));
+        return Result<void>.err(Error($"'{copy[0]}' {written.is_err() ? "did not take the text" : how}"));
     }
     return Result<void>.ok();
 }
 
-# The clipboard's text, through the clipboard's program.
+# The clipboard's text, through `tool`, from `_term_clipboard_tool`.
 [Target(OS(Linux) || OS(Mac))]
-_term_clipboard_read(): Result<String> {
-    var tool = _term_clipboard_tool();
-    if (tool is Err(error)) {
-        return Result<String>.err(error);
-    }
-    var (copy, paste) = _term_clipboard_commands(tool.value());
+_term_clipboard_read(tool: String): Result<String> {
+    var (copy, paste) = _term_clipboard_commands(tool);
     var output = _term_clipboard_command(paste).run();
     if (output is Err(error)) {
         return Result<String>.err(Error($"could not run '{paste[0]}': {error.message}"));

@@ -101,6 +101,9 @@ export struct Clipboard {
     ## The most bytes of text `copy` sends through OSC 52; longer text
     ## fails with `ClipboardError.TooLarge` rather than being cut.
     const osc52_limit: ulong;
+    # The OS's clipboard program (or Windows' clipboard), or why there is
+    # none: found once, so `backend` and each call agree.
+    const _tool: Result<String>;
 
     ## Makes a clipboard, choosing its backend.
     ##
@@ -110,7 +113,8 @@ export struct Clipboard {
     ##   74,994 unless said, whose base64 is just under the 100,000 bytes
     ##   some terminals (hterm, for one) take at most
     construct(backend: ClipboardBackend = ClipboardBackend.Auto, osc52_limit: ulong = 74994) {
-        this.backend = backend == ClipboardBackend.Auto ? _clipboard_auto() : backend;
+        _tool = _term_clipboard_tool();
+        this.backend = backend == ClipboardBackend.Auto ? _clipboard_auto(_tool.is_ok()) : backend;
         this.osc52_limit = osc52_limit;
     }
 
@@ -125,11 +129,10 @@ export struct Clipboard {
     ##   `osc52_limit`, or `Failed` when the OS refused
     copy(text: String): Result<void, ClipboardError> {
         if (backend == ClipboardBackend.System) {
-            var tool = _term_clipboard_tool();
-            if (tool is Err(error)) {
+            if (_tool is Err(error)) {
                 return Result<void, ClipboardError>.err(ClipboardError.NoBackend(error.message));
             }
-            var copied = _term_clipboard_copy(text);
+            var copied = _term_clipboard_copy(_tool.value(), text);
             if (copied is Err(error)) {
                 return Result<void, ClipboardError>.err(ClipboardError.Failed(error.message));
             }
@@ -155,7 +158,10 @@ export struct Clipboard {
     ## answer, which `input` decodes. Other input that comes meanwhile,
     ## such as keys, stays in `input` for its next `read`, so pass the
     ## program's own `InputReader`. An answer that comes after the wait
-    ## arrives there as an `Event.ClipboardReply`.
+    ## arrives there as an `Event.ClipboardReply`. A terminal that asks the
+    ## user first (kitty can) may answer after the wait; with raw mode off
+    ## by then the terminal shows the answer as typed text, so for such a
+    ## terminal keep a `RawMode` on and pass a longer `timeout_ms`.
     ##
     ## @param timeout_ms how long to wait for the terminal's answer, in
     ##   milliseconds; the OS's clipboard answers at once
@@ -167,11 +173,10 @@ export struct Clipboard {
     ##   when the OS refused
     read(timeout_ms: int = 1000, input: InputReader = InputReader()): Result<String, ClipboardError> {
         if (backend == ClipboardBackend.System) {
-            var tool = _term_clipboard_tool();
-            if (tool is Err(error)) {
+            if (_tool is Err(error)) {
                 return Result<String, ClipboardError>.err(ClipboardError.NoBackend(error.message));
             }
-            var pasted = _term_clipboard_read();
+            var pasted = _term_clipboard_read(_tool.value());
             if (pasted is Err(error)) {
                 return Result<String, ClipboardError>.err(ClipboardError.Failed(error.message));
             }
@@ -204,12 +209,13 @@ export _osc52_copy(text: String): String {
     return $"\x1B]52;c;{base64.encode(text.bytes())}\x07";
 }
 
-# The backend `ClipboardBackend.Auto` stands for here and now.
-_clipboard_auto(): ClipboardBackend {
+# The backend `ClipboardBackend.Auto` stands for here and now, where the
+# OS's clipboard is reachable when `system` is true.
+_clipboard_auto(system: bool): ClipboardBackend {
     for (var name in ["SSH_CONNECTION", "SSH_CLIENT", "SSH_TTY"]) {
         if (!os.environment(name).value_or("").is_empty) {
             return ClipboardBackend.Osc52;
         }
     }
-    return _term_clipboard_tool().is_ok() ? ClipboardBackend.System : ClipboardBackend.Osc52;
+    return system ? ClipboardBackend.System : ClipboardBackend.Osc52;
 }
