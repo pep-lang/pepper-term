@@ -1,9 +1,10 @@
 ## Keys and the events beside them: `Key`, `KeyEvent`, `Event`, and the
 ## decoders `KeyDecoder` and `InputDecoder`, which turn the bytes a terminal
-## sends in raw mode into key events, and mouse reports too. Decoding is
-## pure: bytes in, events out, so it needs no terminal and works on bytes
-## from anywhere.
+## sends in raw mode into key events, and mouse reports, pastes and
+## clipboard replies too. Decoding is pure: bytes in, events out, so it
+## needs no terminal and works on bytes from anywhere.
 
+import base64;
 import text;
 import "mouse";
 
@@ -122,6 +123,10 @@ const ESCAPE: u8 = 27;
 
 # Bracketed paste's end marker; its start is "Escape [ 200 ~".
 const _PASTE_END = "\x1B[201~";
+# The start of an OSC 52 reply (the clipboard's contents), which ends with
+# BEL or ST ("Escape \").
+const _REPLY_START = "\x1B]52;";
+const _BEL: u8 = 7;
 
 ## One thing the user did, as `InputDecoder` and `InputReader` give it: a
 ## key press, a mouse report, or a paste.
@@ -136,13 +141,20 @@ export enum Event {
     ## the paste was longer than the decoder's `paste_limit`, `text` holds
     ## its start and `truncated` is true.
     Paste(text: String, truncated: bool),
+    ## The terminal's answer to a clipboard query (OSC 52, which
+    ## `Clipboard.read` sends): the clipboard's text. When it was longer
+    ## than the decoder's `clipboard_limit`, `text` holds its start and
+    ## `truncated` is true. `Clipboard.read` takes it; a program sees one
+    ## only when a reply comes after `Clipboard.read` stopped waiting.
+    ClipboardReply(text: String, truncated: bool),
 }
 
 ## Decodes the bytes a terminal sends in raw mode into `Event`s: key
 ## presses (see `KeyDecoder`), mouse reports, in xterm's SGR encoding
 ## (`ESC [ < b ; x ; y M`, or `m` for a release) and its older X10 one
-## (`ESC [ M` and three bytes), and bracketed pastes (`ESC [ 200 ~`, the
-## text, then `ESC [ 201 ~`).
+## (`ESC [ M` and three bytes), bracketed pastes (`ESC [ 200 ~`, the
+## text, then `ESC [ 201 ~`), and OSC 52 clipboard replies (`ESC ] 52 ;`,
+## the selection, `;`, the text in base64, then BEL or `ESC \`).
 ##
 ## Feed it bytes as they arrive. A sequence split across reads is held
 ## until the rest comes, and a lone Escape is held until `flush`, as with
@@ -155,6 +167,11 @@ export enum Event {
 ## rest is dropped. When the end marker never comes, `flush` gives back
 ## what was held, the first `paste_limit` bytes, as the keys it would have
 ## been without bracketing.
+##
+## A clipboard reply is held the same way, up to `clipboard_limit` bytes of
+## text. One that is not base64, or is cut short by another escape
+## sequence, decodes as `Key.Unknown`, and so does one whose end never
+## comes, at `flush`.
 ##
 ## @example
 ##     import term;
@@ -176,23 +193,32 @@ export struct InputDecoder {
     var _pasting = false;
     var _paste = Array<u8>();
     var _paste_truncated = false;
+    # Whether a clipboard reply is under way; its bytes go in `_paste`.
+    var _replying = false;
 
     ## The most bytes of one paste kept; the rest is dropped.
     const paste_limit: ulong;
+    ## The most bytes of text of one clipboard reply kept; the rest is
+    ## dropped.
+    const clipboard_limit: ulong;
 
     ## Makes a decoder.
     ##
     ## @param paste_limit the most bytes of one paste kept, 1 MiB unless
     ##   said
-    construct(paste_limit: ulong = 1048576) {
+    ## @param clipboard_limit the most bytes of text of one clipboard reply
+    ##   kept, 1 MiB unless said
+    construct(paste_limit: ulong = 1048576, clipboard_limit: ulong = 1048576) {
         this.paste_limit = paste_limit;
+        this.clipboard_limit = clipboard_limit;
     }
 
     ## Whether bytes are held that may begin a longer sequence, or a paste
-    ## is under way, so a caller knows to wait and then `flush`.
+    ## or clipboard reply is under way, so a caller knows to wait and then
+    ## `flush`.
     var has_pending: bool {
         get {
-            return _pending.count > 0 || _pasting;
+            return _pending.count > 0 || _in_text();
         }
     }
 
@@ -202,6 +228,12 @@ export struct InputDecoder {
         get {
             return _pasting;
         }
+    }
+
+    # Whether a paste or a clipboard reply is under way: text that may take
+    # many reads, which a reader waits longer for.
+    _in_text(): bool {
+        return _pasting || _replying;
     }
 
     ## Adds `bytes` and returns the events they complete, in order. Bytes
@@ -227,7 +259,31 @@ export struct InputDecoder {
     _drain(final: bool): Event[] {
         var events = Array<Event>();
         ulong start = 0;
-        while (start < _pending.count || (final && _pasting)) {
+        while (start < _pending.count || (final && _in_text())) {
+            if (_replying) {
+                var end = _reply_end(start);
+                if (end.is_empty() && !final) {
+                    var stop = _pending.count;
+                    if (stop > start && _pending[stop - 1] == ESCAPE) {
+                        stop -= 1;  # may be the start of ST
+                    }
+                    _add_held(start, stop, _reply_limit());
+                    start = stop;
+                    break;
+                }
+                # Without an end (and none coming), or cut short by another
+                # sequence (a terminator of size 0), the reply is broken:
+                # one unknown key, and decoding goes on after it.
+                var (stop, size) = end.value_or((_pending.count, 0));
+                _add_held(start, stop, _reply_limit());
+                start = stop + size;
+                events.append(size == 0 ? Event.Key(KeyEvent(Key.Unknown)) : _take_reply());
+                _paste = Array<u8>();
+                _paste_truncated = false;
+                _replying = false;
+                _after_return = false;
+                continue;
+            }
             if (_pasting) {
                 var end = _paste_end(start);
                 var stop = end.value_or(_pending.count);
@@ -243,7 +299,7 @@ export struct InputDecoder {
                     start = 0;
                     continue;
                 }
-                _add_paste(start, stop);
+                _add_held(start, stop, paste_limit);
                 if (!complete) {
                     start = stop;
                     break;
@@ -257,8 +313,9 @@ export struct InputDecoder {
                 break;
             }
             var line_feed = _pending[start] == '\n';
-            # A paste's start marker sets `_pasting`, and is no event itself.
-            if (!_pasting && !(line_feed && _after_return)) {
+            # A paste's or a reply's start sets `_pasting` or `_replying`,
+            # and is no event itself.
+            if (!_in_text() && !(line_feed && _after_return)) {
                 events.append(event);
             }
             _after_return = _pending[start] == '\r';
@@ -289,18 +346,75 @@ export struct InputDecoder {
 
     # How many bytes from `at` match the start of the paste's end marker.
     _marker_length(at: ulong): ulong {
+        return _prefix_length(at, _PASTE_END);
+    }
+
+    # How many bytes from `at` match the start of `marker`.
+    _prefix_length(at: ulong, marker: String): ulong {
         ulong length = 0;
-        while (length < _PASTE_END.size
+        while (length < marker.size
             && at + length < _pending.count
-            && _pending[at + length] == _PASTE_END.byte_at(length)) {
+            && _pending[at + length] == marker.byte_at(length)) {
             length += 1;
         }
         return length;
     }
 
-    # Adds the bytes from `from` to `to` to the paste, up to the limit.
-    _add_paste(from: ulong, to: ulong) {
-        var room = paste_limit > _paste.count ? paste_limit - _paste.count : 0;
+    # Where the clipboard reply's terminator begins at or after `from`, and
+    # its size: 1 for BEL, 2 for ST, 0 for an Escape that starts another
+    # sequence; none when it has not come yet.
+    _reply_end(from: ulong): (ulong, ulong)? {
+        var rest = _pending.slice(from, _pending.count);
+        var bel = rest.find(_BEL);
+        var escape = rest.find(ESCAPE);
+        if (!escape.is_empty() && (bel.is_empty() || escape.value() < bel.value())) {
+            var at = from + escape.value();
+            if (at + 1 == _pending.count) {
+                return Optional<(ulong, ulong)>.Empty;
+            }
+            return Optional<(ulong, ulong)>.Value((at, _pending[at + 1] == '\\' ? 2 : 0));
+        }
+        if (bel.is_empty()) {
+            return Optional<(ulong, ulong)>.Empty;
+        }
+        return Optional<(ulong, ulong)>.Value((from + bel.value(), 1));
+    }
+
+    # The most bytes of a clipboard reply held: the base64 of
+    # `clipboard_limit` bytes, and room for the selection before it.
+    _reply_limit(): ulong {
+        return 16 + (clipboard_limit + 2) / 3 * 4;
+    }
+
+    # The finished clipboard reply's event, from what is held: the
+    # selection, ";", then the text in base64.
+    _take_reply(): Event {
+        var separator = _paste.find(';');
+        if (separator.is_empty()) {
+            return Event.Key(KeyEvent(Key.Unknown));
+        }
+        var encoded = _paste.split_off(separator.value() + 1);
+        if (_paste_truncated) {
+            encoded.truncate(encoded.count / 4 * 4);
+        }
+        # Never report why: base64's error message quotes the text.
+        var decoded = base64.decode(text.Utf8.decode_lossy(encoded));
+        if (decoded.is_err()) {
+            return Event.Key(KeyEvent(Key.Unknown));
+        }
+        var bytes = decoded.value();
+        var truncated = _paste_truncated || bytes.count > clipboard_limit;
+        if (truncated) {
+            bytes.truncate(bytes.count > clipboard_limit ? clipboard_limit : bytes.count);
+            bytes.truncate(_utf8_whole(bytes));
+        }
+        return Event.ClipboardReply(text.Utf8.decode_lossy(bytes), truncated);
+    }
+
+    # Adds the bytes from `from` to `to` to the paste or reply held, up to
+    # `limit` bytes.
+    _add_held(from: ulong, to: ulong, limit: ulong) {
+        var room = limit > _paste.count ? limit - _paste.count : 0;
         var take = to - from < room ? to - from : room;
         _paste.append_all(_pending.slice(from, from + take).to_array());
         _paste_truncated = _paste_truncated || take < to - from;
@@ -345,6 +459,17 @@ export struct InputDecoder {
             return final ? (1, Event.Key(KeyEvent(Key.Escape))) : (0, unknown);
         }
         var second = _pending[start + 1];
+        if (second == ']') {
+            # An OSC 52 reply's start sets `_replying`; any other is Alt+].
+            var length = _prefix_length(start, _REPLY_START);
+            if (length == _REPLY_START.size) {
+                _replying = true;
+                return (length, unknown);
+            }
+            if (start + length == _pending.count && !final) {
+                return (0, unknown);
+            }
+        }
         if (second == '[' || second == 'O') {
             var sequence = _decode_sequence(start + 2, second == 'O');
             if (!sequence.is_empty()) {
@@ -464,9 +589,9 @@ _utf8_whole(bytes: u8[]): ulong {
     return bytes.count - (start - 1) >= size ? bytes.count : start - 1;
 }
 
-# The keys `events` are, for the readers of keys alone: a mouse report is
-# `Key.Unknown`, and a paste the keys its text types, as before either was
-# decoded.
+# The keys `events` are, for the readers of keys alone: a mouse report or
+# a clipboard reply is `Key.Unknown`, and a paste the keys its text types,
+# as before each was decoded.
 _keys(events: Event[]): KeyEvent[] {
     var keys = Array<KeyEvent>();
     for (var event in events) {
@@ -481,6 +606,9 @@ _keys(events: Event[]): KeyEvent[] {
                 var decoder = InputDecoder();
                 keys.append_all(_keys(decoder.feed(pasted.bytes())));
                 keys.append_all(_keys(decoder.flush()));
+            }
+            ClipboardReply(copied, truncated) => {
+                keys.append(KeyEvent(Key.Unknown));
             }
         }
     }

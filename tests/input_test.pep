@@ -2,7 +2,7 @@
 # console records) and bracketed pastes in, events out.
 
 import term;
-import [EditStatus, Event, InputDecoder, KeyDecoder, LineEditor, MouseButton, MouseEvent, MouseKind] from term;
+import [EditStatus, Event, InputDecoder, Key, KeyDecoder, LineEditor, MouseButton, MouseEvent, MouseKind] from term;
 import text;
 
 # The events `input` decodes to, as text, flushed at the end: a key is
@@ -20,6 +20,9 @@ describe(events: Event[]): String {
             }
             Paste(pasted, truncated) => {
                 parts.append(truncated ? $"paste [{pasted}] cut" : $"paste [{pasted}]");
+            }
+            ClipboardReply(copied, truncated) => {
+                parts.append(truncated ? $"clipboard [{copied}] cut" : $"clipboard [{copied}]");
             }
         }
     }
@@ -289,4 +292,89 @@ pastes_into_a_line_without_submitting_it() {
     }
     expect_true(status == EditStatus.Submitted);
     expect_equal(editor.history.entries[0], "a1\n2\x1B[31mc");
+}
+
+# The OSC 52 reply that holds `encoded`, ended with BEL.
+reply(encoded: String): String {
+    return $"\x1B]52;c;{encoded}\x07";
+}
+
+[Test]
+decodes_a_clipboard_reply_as_one_event() {
+    expect_equal(decoded("a" + reply("aGVsbG8=") + "b"), "key a,clipboard [hello],key b");
+    # Ended with ST, from another selection, empty, and UTF-8.
+    expect_equal(decoded("\x1B]52;p;aGk=\x1B\\x"), "clipboard [hi],key x");
+    expect_equal(decoded(reply("")), "clipboard []");
+    expect_equal(decoded(reply("w6nigqzwn5iA")), "clipboard [é€😀]");
+    # What `Clipboard.copy` writes has the same form, line ends kept.
+    expect_equal(decoded(term._osc52_copy("one\ntwo\r")), "clipboard [one\ntwo\r]");
+}
+
+[Test]
+joins_a_clipboard_reply_split_across_reads() {
+    var decoder = InputDecoder();
+    var events = Array<Event>();
+    for (var byte in "\x1B]52;c;aGVsbG8=\x1B\\q".bytes()) {
+        var one = Array<u8>();
+        one.append(byte);
+        events.append_all(decoder.feed(one));
+        if (events.count == 0) {
+            expect_true(decoder.has_pending);
+        }
+    }
+    expect_equal(describe(events), "clipboard [hello],key q");
+    expect_false(decoder.has_pending);
+    # A long one, in reads of 1000 bytes.
+    var long = "";
+    for (var index in 0..30000) {
+        long += "z";
+    }
+    var bytes = term._osc52_copy(long).bytes();
+    events = Array<Event>();
+    ulong at = 0;
+    while (at < bytes.count) {
+        var end = at + 1000 < bytes.count ? at + 1000 : bytes.count;
+        events.append_all(decoder.feed(bytes.slice(at, end).to_array()));
+        at = end;
+    }
+    expect_equal(events.count, 1);
+    expect_equal(describe(events), $"clipboard [{long}]");
+}
+
+[Test]
+skips_malformed_clipboard_replies() {
+    # Not base64, no selection, cut short by another sequence: each is one
+    # unknown key, and decoding goes on.
+    expect_equal(decoded(reply("@@@@") + "z"), "key Unknown,key z");
+    expect_equal(decoded(reply("a") + "z"), "key Unknown,key z");
+    expect_equal(decoded("\x1B]52;aGk=\x07z"), "key Unknown,key z");
+    expect_equal(decoded("\x1B]52;c;aGk\x1B[Az"), "key Unknown,key Up,key z");
+    # Its end never comes.
+    expect_equal(decoded("\x1B]52;c;aGk="), "key Unknown");
+    # Not OSC 52: the keys typed.
+    expect_equal(decoded("\x1B]"), "key Alt+]");
+    expect_equal(decoded("\x1B]5x"), "key Alt+],key 5,key x");
+}
+
+[Test]
+cuts_a_clipboard_reply_at_its_limit() {
+    var decoder = InputDecoder(clipboard_limit = 4);
+    expect_equal(describe(decoder.feed((reply("aGVsbG8gd29ybGQ=") + "x").bytes())), "clipboard [hell] cut,key x");
+    # Never in the middle of a character, and past what is held too.
+    expect_equal(describe(decoder.feed(term._osc52_copy("abcé").bytes())), "clipboard [abc] cut");
+    var long = "";
+    for (var index in 0..1000) {
+        long += "ab";
+    }
+    expect_equal(describe(decoder.feed(term._osc52_copy(long).bytes())), "clipboard [abab] cut");
+    expect_equal(describe(decoder.feed(term._osc52_copy("abcd").bytes())), "clipboard [abcd]");
+    expect_equal(InputDecoder().clipboard_limit, 1048576);
+}
+
+[Test]
+reads_clipboard_replies_as_unknown_keys() {
+    var keys = KeyDecoder().feed((reply("aGk=") + "q").bytes());
+    expect_equal(keys.count, 2);
+    expect_equal(keys[0].to_string(), "Unknown");
+    expect_equal(keys[1].text, "q");
 }

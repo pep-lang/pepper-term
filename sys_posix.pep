@@ -1,7 +1,11 @@
 ## The terminal on Linux and macOS, through termios, private to the module.
-## Every platform's file declares the same `_term_` functions.
+## Every platform's file declares the same `_term_` functions. The OS's
+## clipboard is reached through the programs that serve it: `pbcopy` and
+## `pbpaste` on macOS, and `wl-copy`, `xclip` or `xsel` on Linux.
 
 import async;
+import os;
+import process;
 
 [Target(OS(Linux) || OS(Mac))]
 extern int isatty(int fd);
@@ -249,4 +253,96 @@ _term_on_signal(number: int) {
     # unblocked.
     signal(number, __null);
     raise(number);
+}
+
+# The program that serves the OS's clipboard, as `ClipboardBackend.System`
+# says: its name, or why there is none.
+[Target(OS(Linux) || OS(Mac))]
+_term_clipboard_tool(): Result<String> {
+    if (os.system_os() == os.OperatingSystem.Mac) {
+        if (process.find_executable("pbcopy").is_empty()) {
+            return Result<String>.err(Error("no 'pbcopy' on the PATH"));
+        }
+        return Result<String>.ok("pbcopy");
+    }
+    if (!os.environment("WAYLAND_DISPLAY").value_or("").is_empty && !process.find_executable("wl-copy").is_empty()) {
+        return Result<String>.ok("wl-copy");
+    }
+    if (!os.environment("DISPLAY").value_or("").is_empty) {
+        for (var tool in ["xclip", "xsel"]) {
+            if (!process.find_executable(tool).is_empty()) {
+                return Result<String>.ok(tool);
+            }
+        }
+    }
+    return Result<String>.err(
+        Error("no 'wl-copy' (with WAYLAND_DISPLAY set) or 'xclip' or 'xsel' (with DISPLAY set) on the PATH")
+    );
+}
+
+# The command lines that copy to and read from the clipboard through `tool`.
+[Target(OS(Linux) || OS(Mac))]
+_term_clipboard_commands(tool: String): (String[], String[]) {
+    if (tool == "pbcopy") {
+        return (["pbcopy"], ["pbpaste"]);
+    }
+    if (tool == "wl-copy") {
+        return (["wl-copy"], ["wl-paste", "--no-newline"]);
+    }
+    if (tool == "xclip") {
+        return (["xclip", "-selection", "clipboard", "-in"], ["xclip", "-selection", "clipboard", "-out"]);
+    }
+    return (["xsel", "--clipboard", "--input"], ["xsel", "--clipboard", "--output"]);
+}
+
+# Starts the command line `command`, with its standard error dropped.
+[Target(OS(Linux) || OS(Mac))]
+_term_clipboard_command(command: String[]): process.Command {
+    return process
+        .Command(command[0])
+        .arguments(command.slice(1, command.count).to_array())
+        .stderr(process.Stream.Null);
+}
+
+# Puts `copied` on the clipboard, through the clipboard's program.
+[Target(OS(Linux) || OS(Mac))]
+_term_clipboard_copy(copied: String): Result<void> {
+    var tool = _term_clipboard_tool();
+    if (tool is Err(error)) {
+        return Result<void>.err(error);
+    }
+    var (copy, paste) = _term_clipboard_commands(tool.value());
+    # wl-copy, xclip and xsel stay behind to serve the clipboard, holding
+    # whatever streams they were given: a pipe for output would never end.
+    var started = _term_clipboard_command(copy).stdin(process.Stream.Pipe).stdout(process.Stream.Null).spawn();
+    if (started is Err(error)) {
+        return Result<void>.err(Error($"could not start '{copy[0]}': {error.message}"));
+    }
+    var child = started.value();
+    child.stdin().write_all(copied);
+    child.stdin().close();
+    var status = child.wait();
+    if (status.is_err() || !status.value().success()) {
+        var how = status.is_err() ? "could not be waited for" : $"ended with {status.value()}";
+        return Result<void>.err(Error($"'{copy[0]}' {how}"));
+    }
+    return Result<void>.ok();
+}
+
+# The clipboard's text, through the clipboard's program.
+[Target(OS(Linux) || OS(Mac))]
+_term_clipboard_read(): Result<String> {
+    var tool = _term_clipboard_tool();
+    if (tool is Err(error)) {
+        return Result<String>.err(error);
+    }
+    var (copy, paste) = _term_clipboard_commands(tool.value());
+    var output = _term_clipboard_command(paste).run();
+    if (output is Err(error)) {
+        return Result<String>.err(Error($"could not run '{paste[0]}': {error.message}"));
+    }
+    if (!output.value().status.success()) {
+        return Result<String>.err(Error($"'{paste[0]}' ended with {output.value().status}"));
+    }
+    return Result<String>.ok(output.value().stdout);
 }

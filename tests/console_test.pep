@@ -113,6 +113,7 @@ describe(event: Event?): String {
         Key(key) => $"key {key}",
         Mouse(mouse) => $"mouse {mouse}",
         Paste(pasted, truncated) => $"paste [{pasted}]",
+        ClipboardReply(copied, truncated) => $"clipboard [{copied}]",
     };
 }
 

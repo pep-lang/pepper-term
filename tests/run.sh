@@ -4,10 +4,12 @@
 # Usage: tests/run.sh [path/to/pepper]   (default: pepper on PATH)
 #
 # Then it builds the examples and runs them on piped input, which is how
-# they behave without a terminal. On Linux and macOS it also runs
-# tests/restore/main.pep on a pseudo-terminal (through `script`) and checks
-# the terminal's settings are back as they were after each way the program
-# can end with raw mode on.
+# they behave without a terminal, and copies to and reads the OS's
+# clipboard (a fake wl-copy on Linux, pbcopy on macOS). On Linux and macOS
+# it also runs tests/restore/main.pep on a pseudo-terminal (through
+# `script`) and checks the terminal's settings are back as they were after
+# each way the program can end with raw mode on, and checks OSC 52's copy
+# and its read's timeout there.
 set -euxo pipefail
 
 root="$(cd "$(dirname "$0")/.." && pwd)"
@@ -20,7 +22,7 @@ mkdir "$build/packages"
 ln -s "$root" "$build/packages/term"
 "$pepper" test -I "$build/packages" "$root/tests"
 
-for program in repl keys events; do
+for program in repl keys events clipboard; do
     "$pepper" build -I "$build/packages" "$root/examples/$program/main.pep" -o "$build/$program"
 done
 "$pepper" build -I "$build/packages" "$root/tests/restore/main.pep" -o "$build/restore"
@@ -42,6 +44,32 @@ expect "$(printf '\033[<0;3;4M\033[<64;1;1Mxq' | "$build/events" | tr -d '\r')" 
 expect "$(printf '\033[200~a\rb\033[201~q' | "$build/events" | tr -d '\r')" 'paste of 3 bytes: a\nb'
 big="$(head -c 5000 /dev/zero | tr '\0' x)"
 expect "$(printf '\033[200~%s\033[201~q' "$big" | "$build/events" | tr -d '\r')" "paste of 5000 bytes: $big"
+
+# The OS's clipboard, through its program: on Linux a fake wl-copy and
+# wl-paste on the PATH, which keep the text in a file; on macOS the real
+# pbcopy and pbpaste (Windows' is tested in tests/clipboard_test.pep).
+clipboard_round_trip() {
+    expect "$(printf 'h\303\251llo\nworld' | "$@" "$build/clipboard" copy)" 'copied, through System'
+    expect "$("$@" "$build/clipboard" < /dev/null)" "$(printf 'read, through System: h\303\251llo\nworld')"
+}
+case "$(uname -s)" in
+    Linux)
+        mkdir "$build/fake"
+        printf '#!/bin/sh\ncat > "$FAKE_CLIPBOARD"\n' > "$build/fake/wl-copy"
+        printf '#!/bin/sh\n[ "$1" = --no-newline ] || exit 2\ncat "$FAKE_CLIPBOARD"\n' > "$build/fake/wl-paste"
+        chmod +x "$build/fake/wl-copy" "$build/fake/wl-paste"
+        clipboard_round_trip env -u DISPLAY WAYLAND_DISPLAY=fake PATH="$build/fake:$PATH" FAKE_CLIPBOARD="$build/copied"
+        expect "$(cat "$build/copied")" "$(printf 'h\303\251llo\nworld')"
+        # With no clipboard program, Auto is OSC 52, which needs a terminal.
+        expect "$(env -u DISPLAY -u WAYLAND_DISPLAY "$build/clipboard" < /dev/null || true)" \
+            'could not read, through Osc52: no clipboard: standard input and output, which OSC 52 needs, are not a terminal'
+        ;;
+    Darwin)
+        saved="$(pbpaste)"
+        clipboard_round_trip env
+        printf '%s' "$saved" | pbcopy
+        ;;
+esac
 
 case "$(uname -s)" in
     Linux) on_terminal() { script -qec "$1" /dev/null; } ;;
@@ -81,4 +109,12 @@ for how in return panic signal forget; do
     after="$(cat "$build/typescript")"
     turned_off "$how" "$after" $'\e[?1006h' $'\e[?1006l\e[?1003l\e[?1002l\e[?1000l' "mouse reporting"
     turned_off "$how" "$after" $'\e[?2004h' $'\e[?2004l' "bracketed paste"
+done
+
+# OSC 52 on a terminal (SSH_TTY makes Auto choose it): a copy writes the
+# sequence, and a read the terminal does not answer (`script` answers
+# nothing) times out rather than hanging.
+on_terminal "printf hi | SSH_TTY=x '$build/clipboard' copy; SSH_TTY=x '$build/clipboard'" < /dev/null > "$build/typescript" 2>&1 || true
+for want in $'copied, through Osc52' $'\e]52;c;aGk=\a' $'\e]52;c;?\a' 'could not read, through Osc52: the terminal did not answer'; do
+    grep -qF "$want" "$build/typescript" || { cat -v "$build/typescript" >&2; echo "error: OSC 52: no $(printf %q "$want")" >&2; exit 1; }
 done

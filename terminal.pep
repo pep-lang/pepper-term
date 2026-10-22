@@ -199,6 +199,7 @@ export enum MouseTracking {
 ##                         Key(key) => print($"key {key}\r"),
 ##                         Mouse(click) => print($"mouse {click}\r"),
 ##                         Paste(text, truncated) => print($"paste {text}\r"),
+##                         else => {}
 ##                     }
 ##                 }
 ##             }
@@ -343,8 +344,8 @@ export restore() {
 # How long to wait, after bytes that may start an escape sequence, for the
 # rest of it before deciding they were the Escape key.
 const _ESCAPE_WAIT_MS = 50;
-# How long to wait for more of a paste whose end has not come, before
-# deciding it never will.
+# How long to wait for more of a paste or a clipboard reply whose end has
+# not come, before deciding it never will.
 const _PASTE_WAIT_MS = 1000;
 
 ## Reads what the user does from standard input, decoding it with an
@@ -386,7 +387,7 @@ export struct InputReader {
         _ready = Array<Event>();
         _next = 0;
         var bytes = Array<u8>();
-        var wait = _decoder.pasting ? _PASTE_WAIT_MS : (_decoder.has_pending ? _ESCAPE_WAIT_MS : -1);
+        var wait = _decoder._in_text() ? _PASTE_WAIT_MS : (_decoder.has_pending ? _ESCAPE_WAIT_MS : -1);
         long count = 0;
         if (_terminal) {
             count = _term_read(bytes, wait);
@@ -400,11 +401,46 @@ export struct InputReader {
             return;
         }
         _ready = count == 0 ? _decoder.flush() : _decoder.feed(bytes);
-        if (!_terminal && _decoder.has_pending && !_decoder.pasting) {
+        if (!_terminal && _decoder.has_pending && !_decoder._in_text()) {
             # A pipe cannot be waited on everywhere: what came is all there
             # is. A paste's end comes in a later read, or the pipe's does.
             _ready.append_all(_decoder.flush());
         }
+    }
+
+    # Waits at most `timeout_ms` milliseconds for a clipboard reply, keeping
+    # the other events that come meanwhile for `read`: the reply's text and
+    # whether it was cut, or none when the time runs out first, or the
+    # input is not a terminal or has ended.
+    _read_reply(timeout_ms: int): (String, bool)? {
+        var started = os.Instant.now();
+        while (true) {
+            # A while loop, not `for`: stable 0.10.1 cannot build a tuple
+            # inside a range loop (pep-lang/pepper#75, fixed since).
+            var index = _next;
+            while (index < _ready.count) {
+                if (_ready[index] is ClipboardReply(copied, truncated)) {
+                    _ready.remove_at(index);
+                    return Optional<(String, bool)>.Value((copied, truncated));
+                }
+                index += 1;
+            }
+            var left = timeout_ms as long - started.elapsed().milliseconds() as long;
+            if (!_terminal || _ended || left <= 0) {
+                return Optional<(String, bool)>.Empty;
+            }
+            var bytes = Array<u8>();
+            var count = _term_read(bytes, left as int);
+            _ready = _ready.split_off(_next);
+            _next = 0;
+            if (count < 0) {
+                _ended = true;
+                _ready.append_all(_decoder.flush());
+            } else if (count > 0) {
+                _ready.append_all(_decoder.feed(bytes));
+            }
+        }
+        return Optional<(String, bool)>.Empty;
     }
 }
 
@@ -520,6 +556,7 @@ export struct LineReader {
                     Paste(pasted, truncated) => {
                         editor.paste(pasted);
                     }
+                    ClipboardReply(copied, truncated) => {}
                 }
                 var terminal = size();
                 var width = terminal.is_empty() ? 0 : terminal.value().columns;

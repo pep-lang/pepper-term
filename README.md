@@ -1,8 +1,9 @@
 # pepper-term
 
 Interactive terminal programs for [Pepper](https://github.com/pep-lang/pepper):
-raw mode, key and mouse input, bracketed paste, readline-style line
-editing with history, cursor control, and 16, 256 and true colors. It uses
+raw mode, key and mouse input, bracketed paste, the clipboard,
+readline-style line editing with history, cursor control, and 16, 256 and
+true colors. It uses
 termios on Linux and macOS and the Console API on Windows, and restores
 the terminal however the program ends, a panic included.
 
@@ -21,11 +22,15 @@ One module, **`term`**:
   buttons, drags, or every move. **`PasteMode`** turns bracketed paste
   on the same way. **`InputReader`** and **`InputDecoder`** read key
   presses, mouse reports and pastes together, as **`Event`**s:
-  `Event.Key(KeyEvent)`, `Event.Mouse(MouseEvent)`, or
-  `Event.Paste(text, truncated)`, a **`MouseEvent`** holding its
+  `Event.Key(KeyEvent)`, `Event.Mouse(MouseEvent)`,
+  `Event.Paste(text, truncated)`, or `Event.ClipboardReply(text,
+  truncated)`, a **`MouseEvent`** holding its
   **`MouseKind`** (down, up, drag, moved, scroll up, down, left or
   right), **`MouseButton`**, zero-based column and row, and Ctrl, Alt
   and Shift.
+- **`Clipboard`** copies text to the clipboard and reads it, through the
+  OS's clipboard or the terminal's (OSC 52), as **`ClipboardBackend`**
+  says; failures are **`ClipboardError`**s.
 - **`Style`**, **`Color`** and **`BasicColor`** color and style text;
   **`colors_enabled()`** says whether to, following `NO_COLOR`.
 - **`move_to`**, `move_up`, `move_down`, `move_left`, `move_right`,
@@ -59,8 +64,9 @@ main(): int {
 ```
 
 This is `examples/repl/main.pep`; `examples/keys/main.pep` shows each key
-pressed in raw mode, and `examples/events/main.pep` each key, mouse report
-and paste.
+pressed in raw mode, `examples/events/main.pep` each key, mouse report
+and paste, and `examples/clipboard/main.pep` copies to and reads the
+clipboard.
 
 Without a terminal (input or output a pipe or a file), everything still
 works: `RawMode` does nothing and is not `active`, `LineReader` reads lines
@@ -101,6 +107,51 @@ line without submitting it, and Enter then submits the whole text.
   `KeyReader` reads it without `PasteMode`.
 - `KeyDecoder` and `KeyReader` turn a paste back into the keys of its text.
 
+## Clipboard
+
+```pepper
+var clipboard = term.Clipboard();          # ClipboardBackend.Auto
+var copied = clipboard.copy(selected);     # Result<void, ClipboardError>
+var text = clipboard.read();               # Result<String, ClipboardError>
+```
+
+The backend is chosen when the `Clipboard` is made, and `backend` says
+which: `Auto` resolves to one of the other two, and never changes later.
+
+- **`System`**, the OS's clipboard. On Windows, Windows' own
+  (`OpenClipboard`, `SetClipboardData`, `CF_UNICODETEXT`). On macOS,
+  `pbcopy` and `pbpaste`. On Linux, `wl-copy` and `wl-paste` when
+  `WAYLAND_DISPLAY` is set, else `xclip` or else `xsel` when `DISPLAY`
+  is, the first found on the `PATH`. Without one, `copy` and `read` fail
+  with `ClipboardError.NoBackend`, which names what is missing.
+- **`Osc52`**, the terminal's: `copy` writes `ESC ] 52 ; c ; <base64>
+  BEL` to standard output, and the terminal sets the clipboard of the
+  machine the user sits at, so it works over SSH. The terminal sends
+  nothing back, so success means the request was written. Text longer
+  than `osc52_limit` (74,994 bytes unless set, whose base64 is under the
+  100,000 bytes some terminals take) fails with `TooLarge` rather than
+  being cut. `read` asks with `ESC ] 52 ; c ; ? BEL` and waits for the
+  answer, at most `timeout_ms` (a second unless set): most terminals turn
+  reading off and answer nothing, so it then fails with `TimedOut`, never
+  hanging. The answer is decoded by `InputDecoder` like a paste, across
+  reads and up to its `clipboard_limit` (1 MiB). Pass the program's own
+  `InputReader` to `read`, so keys typed while it waits are kept for it.
+- **`Auto`** (the default) is `Osc52` when the program runs over SSH
+  (`SSH_CONNECTION`, `SSH_CLIENT` or `SSH_TTY` is set), since the OS's
+  clipboard would be the remote machine's, and otherwise `System` when
+  the OS has one it can reach, else `Osc52`.
+
+Inside **tmux**, OSC 52 reaches tmux rather than the terminal. With
+`set -g set-clipboard on` in `.tmux.conf`, tmux takes the copy into its
+buffer and passes it on to the terminal; whether it answers reads depends
+on its version. This package writes the plain sequence and does not wrap it in
+tmux's pass-through (`ESC P tmux; ... ESC \`), which `set-clipboard`
+makes unneeded. **GNU screen** passes OSC 52 on only inside its own
+`ESC P ... ESC \` wrapping and cuts long ones short; this package does
+not emit that wrapping, so under screen use `System`.
+
+The clipboard's text is never put in an error or a log.
+
 ## Limits
 
 - Each code point counts as one column: wide (CJK, emoji) and combining
@@ -140,13 +191,19 @@ tests/run.sh path/to/pepper
 ```
 
 runs the `[Test]` functions in `tests/` with `pepper test` (key, mouse and
-paste decoding, Windows mouse records, line editing and styles, which
-need no terminal, and, on Windows, reading records written into a real
-console), runs the examples on piped input, and on Linux and
+paste decoding, OSC 52 encoding and reply decoding, Windows mouse
+records, line editing and styles, which need no terminal, and, on
+Windows, reading records written into a real console and copying to and
+reading the real clipboard, which it skips, saying so, when the clipboard
+cannot be opened), runs the examples on piped input, copies to and
+reads the OS's clipboard through `examples/clipboard` (a fake `wl-copy`
+and `wl-paste` on Linux, the real `pbcopy` and `pbpaste` on macOS), and
+on Linux and
 macOS runs `tests/restore/main.pep` on a pseudo-terminal (through
 `script`). That checks the terminal's settings come back, and mouse
 reporting and bracketed paste are turned off, after a return, a panic,
-SIGTERM, and a `RawMode` kept alive past `main`.
+SIGTERM, and a `RawMode` kept alive past `main`, and that an OSC 52
+copy is written and a read the terminal does not answer times out.
 
 ## Releasing
 
