@@ -1,7 +1,8 @@
 ## The terminal itself: whether the standard streams are one, its size,
-## raw mode, and reading keys and edited lines from it. Each part degrades
-## when there is no terminal (input from a pipe or a file, output to one):
-## raw mode does nothing, keys are decoded from the bytes as they come,
+## raw mode, mouse reporting, and reading keys, mouse reports and edited
+## lines from it. Each part degrades when there is no terminal (input from
+## a pipe or a file, output to one): raw mode and mouse reporting do
+## nothing, keys are decoded from the bytes as they come,
 ## lines are read plainly, and `colors_enabled` is false.
 
 import io;
@@ -9,6 +10,7 @@ import os;
 import text;
 import "keys";
 import "line";
+import "mouse";
 import "sys_posix";
 import "sys_windows";
 
@@ -152,11 +154,112 @@ export struct RawMode {
 
 extend RawMode with Scoped<RawMode>;
 
-## Turns raw mode off now, wherever it was turned on: for a program about
-## to end with `process.exit`, which runs no exit handlers. Does nothing
-## when raw mode is off.
+## Which mouse reports `MouseMode` asks for.
+export enum MouseTracking {
+    ## Presses, releases and the wheel (xterm's mode 1000).
+    Buttons,
+    ## Those, and moves while a button is held (mode 1002).
+    Drag,
+    ## Those, and every move (mode 1003).
+    Motion,
+}
+
+## Mouse reporting: while it is on, the terminal sends mouse presses,
+## releases, the wheel and, as `tracking` says, moves, which
+## `InputReader` reads as `Event.Mouse`. Making a `MouseMode` turns it on;
+## `exit`, or the last reference going away, turns it off again. It is off
+## unless a program asks: without it the terminal keeps the mouse, to
+## select and scroll.
+##
+## Use it in a `with` block, inside a `RawMode`'s. Like raw mode it is
+## turned off when the program ends while it is on: at the end of `main`,
+## on a panic, and on SIGTERM, SIGHUP, SIGINT or SIGQUIT (POSIX); call
+## `restore()` before `process.exit`.
+##
+## On Linux and macOS it asks the terminal for xterm's reports in SGR
+## encoding (mode 1006), which every current terminal speaks. On Windows
+## it turns on the console's mouse input, and turns Quick Edit (selecting
+## with the mouse) off while it is on.
+##
+## Without a terminal on standard input and output it does nothing, and
+## `active` is false. Mouse reporting is one setting of the whole
+## terminal, so while one `MouseMode` has it on, another is not `active`.
+##
+## @example
+##     import term;
+##     import [Event] from term;
+##
+##     main(): int {
+##         with (var raw = term.RawMode()) {
+##             with (var mouse = term.MouseMode()) {
+##                 var input = term.InputReader();
+##                 var event = input.read();
+##                 if (!event.is_empty()) {
+##                     match (event.value()) {
+##                         Key(key) => print($"key {key}\r"),
+##                         Mouse(click) => print($"mouse {click}\r"),
+##                     }
+##                 }
+##             }
+##         }
+##         return 0;
+##     }
+export struct MouseMode {
+    var _active: bool;
+
+    ## Turns mouse reporting on, when standard input and output are a
+    ## terminal and it is not on already.
+    ##
+    ## @param tracking which reports to ask for
+    construct(tracking: MouseTracking = MouseTracking.Buttons) {
+        _active = _term_mouse_on(_mouse_mode_code(tracking));
+    }
+
+    destruct {
+        exit();
+    }
+
+    ## Whether this `MouseMode` turned reporting on, and will turn it off.
+    var active: bool {
+        get {
+            return _active;
+        }
+    }
+
+    ## Returns this `MouseMode`, for a `with` block.
+    ##
+    ## @returns this
+    enter(): MouseMode {
+        return this;
+    }
+
+    ## Turns mouse reporting off, if this `MouseMode` turned it on. Later
+    ## calls do nothing.
+    exit() {
+        if (_active) {
+            _active = false;
+            _term_mouse_off();
+        }
+    }
+}
+
+extend MouseMode with Scoped<MouseMode>;
+
+# xterm's mode number for `tracking`: what the platform files take.
+_mouse_mode_code(tracking: MouseTracking): int {
+    return match (tracking) {
+        Buttons => 1000,
+        Drag => 1002,
+        Motion => 1003,
+    };
+}
+
+## Turns raw mode and mouse reporting off now, wherever they were turned
+## on: for a program about to end with `process.exit`, which runs no exit
+## handlers. Does nothing when both are off.
 export restore() {
     # process.exit skips atexit handlers: pep-lang/pepper#73.
+    _term_mouse_off();
     _term_restore();
 }
 
@@ -164,16 +267,16 @@ export restore() {
 # rest of it before deciding they were the Escape key.
 const _ESCAPE_WAIT_MS = 50;
 
-## Reads key presses from standard input, decoding them with a
-## `KeyDecoder`.
+## Reads what the user does from standard input, key presses and, while a
+## `MouseMode` is on, mouse reports, decoding them with an `InputDecoder`.
 ##
 ## On a terminal in raw mode, each key arrives as it is pressed. Outside
 ## raw mode the terminal sends nothing until Enter. Without a terminal,
 ## the input's bytes are decoded as they come: text gives `Key.Char`
 ## events, and line ends give `Key.Enter`.
-export struct KeyReader {
-    var _decoder = KeyDecoder();
-    var _ready = Array<KeyEvent>();
+export struct InputReader {
+    var _decoder = InputDecoder();
+    var _ready = Array<Event>();
     var _next: ulong = 0;
     var _ended = false;
     var _terminal: bool;
@@ -183,22 +286,22 @@ export struct KeyReader {
         _terminal = input_is_terminal();
     }
 
-    ## Waits for the next key press.
+    ## Waits for the next key press or mouse report.
     ##
-    ## @returns the key, or none at the end of input
-    read(): KeyEvent? {
+    ## @returns the event, or none at the end of input
+    read(): Event? {
         while (_next >= _ready.count) {
             if (_ended) {
-                return Optional<KeyEvent>.Empty;
+                return Optional<Event>.Empty;
             }
             _fill();
         }
         _next += 1;
-        return Optional<KeyEvent>.Value(_ready[_next - 1]);
+        return Optional<Event>.Value(_ready[_next - 1]);
     }
 
     _fill() {
-        _ready = Array<KeyEvent>();
+        _ready = Array<Event>();
         _next = 0;
         var bytes = Array<u8>();
         var wait = _decoder.has_pending ? _ESCAPE_WAIT_MS : -1;
@@ -219,6 +322,26 @@ export struct KeyReader {
             # A pipe cannot be waited on everywhere: what came is all there is.
             _ready.append_all(_decoder.flush());
         }
+    }
+}
+
+## Reads key presses from standard input, as `InputReader` does; a mouse
+## report is `Key.Unknown`.
+export struct KeyReader {
+    var _input = InputReader();
+
+    ## Makes a reader of standard input.
+    construct() {}
+
+    ## Waits for the next key press.
+    ##
+    ## @returns the key, or none at the end of input
+    read(): KeyEvent? {
+        var event = _input.read();
+        if (event.is_empty()) {
+            return Optional<KeyEvent>.Empty;
+        }
+        return Optional<KeyEvent>.Value(_key_of(event.value()));
     }
 }
 

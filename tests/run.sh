@@ -20,7 +20,7 @@ mkdir "$build/packages"
 ln -s "$root" "$build/packages/term"
 "$pepper" test -I "$build/packages" "$root/tests"
 
-for program in repl keys; do
+for program in repl keys mouse; do
     "$pepper" build -I "$build/packages" "$root/examples/$program/main.pep" -o "$build/$program"
 done
 "$pepper" build -I "$build/packages" "$root/tests/restore/main.pep" -o "$build/restore"
@@ -36,6 +36,8 @@ expect() {
 expect "$(printf 'one\r\ntwo\n\nlast' | "$build/repl" | tr -d '\r')" \
     "$(printf '> you typed one\n> you typed two\n> you typed \n> you typed last\n> 3 lines')"
 expect "$(printf 'a\033[A\033[1;5C\303\251\tq' | "$build/keys" | tr -d '\r')" "$(printf 'a\nUp\nCtrl+Right\n\303\251\nTab')"
+expect "$(printf '\033[<0;3;4M\033[<64;1;1Mxq' | "$build/mouse" | tr -d '\r')" \
+    "$(printf 'mouse Left Down at 2,3\nmouse ScrollUp at 0,0\nkey x')"
 
 case "$(uname -s)" in
     Linux) on_terminal() { script -qec "$1" /dev/null; } ;;
@@ -58,4 +60,17 @@ for how in return panic signal forget; do
         echo "error: $how left the terminal in raw mode" >&2
         exit 1
     }
+done
+
+# With mouse reporting on too: its sequences go to the terminal, which
+# `script` copies out, so the last mouse sequence written must turn
+# reporting off.
+for how in return panic signal forget; do
+    on_terminal "'$build/restore' $how mouse" < /dev/null > "$build/typescript" 2>&1 || true
+    grep -q 'mouse on' "$build/typescript" || { cat -v "$build/typescript" >&2; echo "error: $how: mouse reporting did not turn on" >&2; exit 1; }
+    after="$(cat "$build/typescript")"
+    case "${after##*$'\e[?1006h'}" in
+        *$'\e[?1006l\e[?1003l\e[?1002l\e[?1000l'*) ;;
+        *) cat -v "$build/typescript" >&2; echo "error: $how left mouse reporting on" >&2; exit 1 ;;
+    esac
 done
