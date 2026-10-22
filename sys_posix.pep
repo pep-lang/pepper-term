@@ -182,10 +182,10 @@ _copy(target: __ptr<void>, source: __ptr<void>, size: ulong) {
     }
 }
 
-# Restores the terminal (raw mode and mouse reporting) when the program ends: at exit, and on the signals
-# that end it, a panic's SIGABRT (from `abort`) included. A signal the
-# program already handles keeps its handler: the program's own shutdown
-# then restores the terminal at exit.
+# Restores the terminal (raw mode and mouse reporting) when the program
+# ends: at exit, and on the signals that end it, a panic's SIGABRT (from
+# `abort`) included. A signal the program already handles keeps its
+# handler: the program's own shutdown then restores the terminal at exit.
 [Target(OS(Linux) || OS(Mac))]
 _term_install_hooks() {
     var at_exit: extern () => void = _term_restore_all;

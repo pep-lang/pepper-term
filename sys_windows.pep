@@ -262,10 +262,13 @@ _term_read_records(buffer: u8[], tracking: int): long {
         ok = ReadConsoleInputW(handle, records, 128, count) != 0 && count[0] > 0;
         __ptr<uint> words = unsafe_cast<__ptr<uint>>(records);
         __ptr<short> shorts = unsafe_cast<__ptr<short>>(records);
+        var (left, top, right, bottom) = _term_window();
         for (var index in 0..(ok ? count[0] as ulong : 0)) {
             var at = index * 10;
-            if (records[at] == 1 && words[at / 2 + 1] != 0 && records[at + 7] != 0) {
-                # KEY_EVENT, key down: bKeyDown, wRepeatCount, then UnicodeChar.
+            # Alt+numpad typing gives its character when Alt (VK_MENU, 18) is released.
+            var typed = words[at / 2 + 1] != 0 || records[at + 5] == 18;
+            if (records[at] == 1 && typed && records[at + 7] != 0) {
+                # KEY_EVENT: bKeyDown, wRepeatCount, wVirtualKeyCode, then UnicodeChar.
                 for (var repeat in 0..(records[at + 4] > 0 ? records[at + 4] as ulong : 1)) {
                     utf16.append((records[at + 7] & 255) as u8);
                     utf16.append((records[at + 7] >> 8) as u8);
@@ -275,7 +278,6 @@ _term_read_records(buffer: u8[], tracking: int): long {
                 # dwControlKeyState and dwEventFlags.
                 buffer.append_all(text.Utf16.decode_lossy(utf16).bytes());
                 utf16 = Array<u8>();
-                var (left, top, right, bottom) = _term_window();
                 var x = shorts[at + 2] as long - left;
                 var y = shorts[at + 3] as long - top;
                 var buttons = words[at / 2 + 2];
