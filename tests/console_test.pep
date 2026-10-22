@@ -75,6 +75,11 @@ struct Records {
         _record(2, [column as ushort, row as ushort, buttons, 0, 0, 0, flags, 0]);
     }
 
+    arrow() {
+        _record(1, [1, 0, 1, 38, 72, 0, 0, 0]);
+        _record(1, [0, 0, 1, 38, 72, 0, 0, 0]);
+    }
+
     _key(down: ushort, unit: ushort) {
         # bKeyDown, wRepeatCount 1, wVirtualKeyCode, wVirtualScanCode, UnicodeChar, dwControlKeyState.
         _record(1, [down, 0, 1, 0, 0, unit, 0, 0]);
@@ -153,6 +158,11 @@ read_the_console() {
         records.press(27);
         records.write(input);
         expect_equal(describe(reader.read()), "key Escape");
+        records.arrow();
+        records.press_all("k");
+        records.write(input);
+        expect_equal(describe(reader.read()), "key Up");
+        expect_equal(describe(reader.read()), "key k");
 
         with (var mouse = term.MouseMode(MouseTracking.Buttons)) {
             expect_true(mouse.active);
@@ -168,6 +178,11 @@ read_the_console() {
             expect_equal(describe(reader.read()), "key q");
             expect_equal(describe(reader.read()), "paste [p]");
             # Escape, then a move that is not asked for: still the Escape key.
+            records.arrow();
+            records.press_all("k");
+            records.write(input);
+            expect_equal(describe(reader.read()), "key Up");
+            expect_equal(describe(reader.read()), "key k");
             records.press(27);
             records.mouse(left + 1, top + 1, 0, 1);
             records.write(input);

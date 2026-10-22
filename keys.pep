@@ -153,7 +153,8 @@ export enum Event {
 ## A paste is held until its end marker comes, however many reads it
 ## takes; `pasting` says one is under way. Past `paste_limit` bytes the
 ## rest is dropped. When the end marker never comes, `flush` gives back
-## what was held as the keys it would have been without bracketing.
+## what was held, the first `paste_limit` bytes, as the keys it would have
+## been without bracketing.
 ##
 ## @example
 ##     import term;

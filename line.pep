@@ -173,10 +173,12 @@ export struct LineEditor {
     ##
     ## @param text the text pasted
     paste(text: String) {
+        var tail = _characters.split_off(_cursor);
         for (var c in text) {
-            _characters.insert(_cursor, c);
-            _cursor += 1;
+            _characters.append(c);
         }
+        _cursor = _characters.count;
+        _characters.append_all(tail);
     }
 
     ## Returns the bytes that redraw the line on the terminal row the cursor

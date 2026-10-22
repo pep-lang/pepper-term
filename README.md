@@ -95,7 +95,7 @@ line without submitting it, and Enter then submits the whole text.
 - A paste longer than the decoder's `paste_limit` (1 MiB unless set) keeps
   its start and is marked `truncated`.
 - A paste whose end marker never comes is held for at most a second, then
-  given back as the keys it would have typed.
+  given back (up to `paste_limit` bytes) as the keys it would have typed.
 - Windows Terminal supports bracketed paste with the same sequences. The
   older Windows console host does not: it types a paste in as keys, as
   `KeyReader` reads it without `PasteMode`.
