@@ -106,7 +106,7 @@ reads_carriage_return_and_line_feed_as_one_enter() {
 
 [Test]
 reports_unknown_sequences() {
-    expect_equal(names("\x1B[200~x"), "Unknown,x");
+    expect_equal(names("\x1B[201~x"), "Unknown,x");
     expect_equal(names("\x1B[<0;3;4M"), "Unknown");
 }
 

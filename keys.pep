@@ -120,26 +120,41 @@ export struct KeyEvent {
 
 const ESCAPE: u8 = 27;
 
+# Bracketed paste's end marker; its start is "Escape [ 200 ~".
+const _PASTE_END = "\x1B[201~";
+
 ## One thing the user did, as `InputDecoder` and `InputReader` give it: a
-## key press or a mouse report.
+## key press, a mouse report, or a paste.
 [Value]
 export enum Event {
     ## A key press.
     Key(key: KeyEvent),
     ## A mouse report, which arrives only while a `MouseMode` is on.
     Mouse(mouse: MouseEvent),
+    ## Text pasted into the terminal, whole, which arrives only while a
+    ## `PasteMode` is on. Line ends are "\n" (terminals send "\r"). When
+    ## the paste was longer than the decoder's `paste_limit`, `text` holds
+    ## its start and `truncated` is true.
+    Paste(text: String, truncated: bool),
 }
 
 ## Decodes the bytes a terminal sends in raw mode into `Event`s: key
-## presses (see `KeyDecoder`) and mouse reports, in xterm's SGR encoding
+## presses (see `KeyDecoder`), mouse reports, in xterm's SGR encoding
 ## (`ESC [ < b ; x ; y M`, or `m` for a release) and its older X10 one
-## (`ESC [ M` and three bytes).
+## (`ESC [ M` and three bytes), and bracketed pastes (`ESC [ 200 ~`, the
+## text, then `ESC [ 201 ~`).
 ##
 ## Feed it bytes as they arrive. A sequence split across reads is held
 ## until the rest comes, and a lone Escape is held until `flush`, as with
 ## `KeyDecoder`. A mouse report the decoder cannot read (a button past the
 ## third, a position of 0, a broken sequence) decodes as `Key.Unknown`;
 ## huge numbers are capped, never overflow.
+##
+## A paste is held until its end marker comes, however many reads it
+## takes; `pasting` says one is under way. Past `paste_limit` bytes the
+## rest is dropped. When the end marker never comes, `flush` gives back
+## what was held, the first `paste_limit` bytes, as the keys it would have
+## been without bracketing.
 ##
 ## @example
 ##     import term;
@@ -149,19 +164,43 @@ export enum Event {
 ##     var events = decoder.feed("\x1B[<0;3;4Mx".bytes());
 ##     match (events[0]) {
 ##         Mouse(mouse) => assert(mouse.kind == MouseKind.Down && mouse.column == 2, "a click"),
-##         Key(key) => panic("a mouse report"),
+##         else => panic("a mouse report"),
 ##     }
 export struct InputDecoder {
     var _pending = Array<u8>();
     # Whether the last byte decoded was a carriage return, so a line feed
     # right after it ends the same line rather than another.
     var _after_return = false;
+    # The paste under way: whether one is, its bytes so far, and whether
+    # bytes past the limit were dropped.
+    var _pasting = false;
+    var _paste = Array<u8>();
+    var _paste_truncated = false;
 
-    ## Whether bytes are held that may begin a longer sequence, so a caller
-    ## knows to wait briefly and then `flush`.
+    ## The most bytes of one paste kept; the rest is dropped.
+    const paste_limit: ulong;
+
+    ## Makes a decoder.
+    ##
+    ## @param paste_limit the most bytes of one paste kept, 1 MiB unless
+    ##   said
+    construct(paste_limit: ulong = 1048576) {
+        this.paste_limit = paste_limit;
+    }
+
+    ## Whether bytes are held that may begin a longer sequence, or a paste
+    ## is under way, so a caller knows to wait and then `flush`.
     var has_pending: bool {
         get {
-            return _pending.count > 0;
+            return _pending.count > 0 || _pasting;
+        }
+    }
+
+    ## Whether a paste has begun and its end has not come yet, so a caller
+    ## knows to wait longer before calling `flush`.
+    var pasting: bool {
+        get {
+            return _pasting;
         }
     }
 
@@ -177,7 +216,8 @@ export struct InputDecoder {
 
     ## Decodes the bytes held as they stand, since no more are coming: a
     ## lone Escape is the Escape key, Escape before a character is Alt with
-    ## it, and an incomplete UTF-8 character is U+FFFD.
+    ## it, an incomplete UTF-8 character is U+FFFD, and a paste whose end
+    ## never came is the keys its text would have been.
     ##
     ## @returns the events, possibly none
     flush(): Event[] {
@@ -187,13 +227,38 @@ export struct InputDecoder {
     _drain(final: bool): Event[] {
         var events = Array<Event>();
         ulong start = 0;
-        while (start < _pending.count) {
+        while (start < _pending.count || (final && _pasting)) {
+            if (_pasting) {
+                var end = _paste_end(start);
+                var stop = end.value_or(_pending.count);
+                var complete = !end.is_empty() && _marker_length(stop) == _PASTE_END.size;
+                if (!complete && final) {
+                    # No end is coming: what was held is typed keys after all.
+                    var rest = _pending.split_off(start);
+                    _pending = _paste;
+                    _pending.append_all(rest);
+                    _paste = Array<u8>();
+                    _pasting = false;
+                    _paste_truncated = false;
+                    start = 0;
+                    continue;
+                }
+                _add_paste(start, stop);
+                if (!complete) {
+                    start = stop;
+                    break;
+                }
+                start = stop + _PASTE_END.size;
+                events.append(_take_paste());
+                continue;
+            }
             var (size, event) = _decode(start, final);
             if (size == 0) {
                 break;
             }
             var line_feed = _pending[start] == '\n';
-            if (!(line_feed && _after_return)) {
+            # A paste's start marker sets `_pasting`, and is no event itself.
+            if (!_pasting && !(line_feed && _after_return)) {
                 events.append(event);
             }
             _after_return = _pending[start] == '\r';
@@ -201,6 +266,58 @@ export struct InputDecoder {
         }
         _pending = _pending.split_off(start);
         return events;
+    }
+
+    # Where the paste's end marker begins at or after `from`, or where the
+    # bytes held end with what may be its start; none when neither.
+    _paste_end(from: ulong): ulong? {
+        var at = from;
+        while (at < _pending.count) {
+            var found = _pending.slice(at, _pending.count).find(ESCAPE);
+            if (found.is_empty()) {
+                break;
+            }
+            at += found.value();
+            var length = _marker_length(at);
+            if (length == _PASTE_END.size || at + length == _pending.count) {
+                return Optional<ulong>.Value(at);
+            }
+            at += 1;
+        }
+        return Optional<ulong>.Empty;
+    }
+
+    # How many bytes from `at` match the start of the paste's end marker.
+    _marker_length(at: ulong): ulong {
+        ulong length = 0;
+        while (length < _PASTE_END.size
+            && at + length < _pending.count
+            && _pending[at + length] == _PASTE_END.byte_at(length)) {
+            length += 1;
+        }
+        return length;
+    }
+
+    # Adds the bytes from `from` to `to` to the paste, up to the limit.
+    _add_paste(from: ulong, to: ulong) {
+        var room = paste_limit > _paste.count ? paste_limit - _paste.count : 0;
+        var take = to - from < room ? to - from : room;
+        _paste.append_all(_pending.slice(from, from + take).to_array());
+        _paste_truncated = _paste_truncated || take < to - from;
+    }
+
+    # The finished paste's event; the decoder goes back to keys.
+    _take_paste(): Event {
+        if (_paste_truncated) {
+            _paste.truncate(_utf8_whole(_paste));
+        }
+        var pasted = text.Utf8.decode_lossy(_paste).replace("\r\n", "\n").replace("\r", "\n");
+        var event = Event.Paste(pasted, _paste_truncated);
+        _paste = Array<u8>();
+        _pasting = false;
+        _paste_truncated = false;
+        _after_return = false;
+        return event;
     }
 
     # Decodes the event whose bytes start at `start`: the number of bytes
@@ -296,6 +413,9 @@ export struct InputDecoder {
                         (size + 3, _mouse_or_unknown(_mouse_from_code(b, x, y, false)))
                     );
                 }
+                if (c == '~' && !ss3 && parameters.count == 1 && parameters[0] == 200) {
+                    _pasting = true;  # a paste's start marker
+                }
                 return Optional<(ulong, Event)>.Value((size, Event.Key(_sequence_key(c, parameters, ss3))));
             } else if (c < 32 || c > 63) {
                 # Not a parameter byte: a broken sequence. Take what came
@@ -329,21 +449,50 @@ _mouse_or_unknown(mouse: MouseEvent?): Event {
     return mouse.is_empty() ? Event.Key(KeyEvent(Key.Unknown)) : Event.Mouse(mouse.value());
 }
 
-# The key `event` is, for the readers of keys alone: a mouse report is
-# `Key.Unknown`, as it was before mouse reports were decoded.
-_key_of(event: Event): KeyEvent {
-    return match (event) {
-        Key(key) => key,
-        Mouse(mouse) => KeyEvent(Key.Unknown),
-    };
+# The length of the longest start of `bytes` that ends with a whole UTF-8
+# character, for a paste cut at its limit.
+_utf8_whole(bytes: u8[]): ulong {
+    var start = bytes.count;
+    while (start > 0 && (bytes[start - 1] & 192) == 128) {
+        start -= 1;
+    }
+    if (start == 0) {
+        return bytes.count;
+    }
+    var lead = bytes[start - 1];
+    ulong size = lead >= 240 ? 4 : (lead >= 224 ? 3 : (lead >= 192 ? 2 : 1));
+    return bytes.count - (start - 1) >= size ? bytes.count : start - 1;
+}
+
+# The keys `events` are, for the readers of keys alone: a mouse report is
+# `Key.Unknown`, and a paste the keys its text types, as before either was
+# decoded.
+_keys(events: Event[]): KeyEvent[] {
+    var keys = Array<KeyEvent>();
+    for (var event in events) {
+        match (event) {
+            Key(key) => {
+                keys.append(key);
+            }
+            Mouse(mouse) => {
+                keys.append(KeyEvent(Key.Unknown));
+            }
+            Paste(pasted, truncated) => {
+                var decoder = InputDecoder();
+                keys.append_all(_keys(decoder.feed(pasted.bytes())));
+                keys.append_all(_keys(decoder.flush()));
+            }
+        }
+    }
+    return keys;
 }
 
 ## Decodes the bytes a terminal sends in raw mode into `KeyEvent`s: UTF-8
 ## characters, control characters, and the escape sequences of xterm and
 ## its kin (VT100, the Linux console, Windows' virtual terminal input) for
 ## the arrows, Home, End, Insert, Delete, Page Up and Down, and F1 to F12,
-## with their modifiers. A mouse report is one `Key.Unknown`; use
-## `InputDecoder` to read it.
+## with their modifiers. A mouse report is one `Key.Unknown`, and a paste
+## the keys its text types; use `InputDecoder` to read them as they are.
 ##
 ## Feed it bytes as they arrive. A sequence split across reads is held
 ## until the rest comes. A lone Escape looks like the start of a sequence,
@@ -385,10 +534,6 @@ export struct KeyDecoder {
     flush(): KeyEvent[] {
         return _keys(_input.flush());
     }
-}
-
-_keys(events: Event[]): KeyEvent[] {
-    return events.iterate().map((event) => _key_of(event)).to_array();
 }
 
 # The key a single byte below 128 is.

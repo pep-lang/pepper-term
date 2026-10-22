@@ -1,12 +1,13 @@
-# Mouse reports: bytes (SGR and X10) and Windows console records in, mouse
-# events out.
+# Input events beside keys: mouse reports (SGR and X10 bytes, and Windows
+# console records) and bracketed pastes in, events out.
 
 import term;
-import [Event, InputDecoder, MouseButton, MouseEvent, MouseKind] from term;
+import [EditStatus, Event, InputDecoder, KeyDecoder, LineEditor, MouseButton, MouseEvent, MouseKind] from term;
 import text;
 
 # The events `input` decodes to, as text, flushed at the end: a key is
-# "key " and its name.
+# "key " and its name, a paste "paste " and its text in brackets ("cut"
+# when truncated).
 describe(events: Event[]): String {
     var parts = Array<String>();
     for (var event in events) {
@@ -16,6 +17,9 @@ describe(events: Event[]): String {
             }
             Mouse(mouse) => {
                 parts.append(mouse.to_string());
+            }
+            Paste(pasted, truncated) => {
+                parts.append(truncated ? $"paste [{pasted}] cut" : $"paste [{pasted}]");
             }
         }
     }
@@ -110,12 +114,12 @@ caps_huge_numbers() {
     var events = InputDecoder().feed("\x1B[<0;99999999999999999999;3M".bytes());
     expect_equal(events.count, 1);
     match (events[0]) {
-        Key(key) => {
-            expect_true(false);
-        }
         Mouse(mouse) => {
             expect_true(mouse.column < 1000000);
             expect_equal(mouse.row, 2);
+        }
+        else => {
+            expect_true(false);
         }
     }
     expect_equal(decoded("\x1B[<99999999999999999999;1;1M"), "key Unknown");
@@ -193,4 +197,96 @@ encodes_windows_events_as_the_reports_decoded() {
     for (var event in events) {
         expect_equal(decoded(event._sgr()), event.to_string());
     }
+}
+
+const START = "\x1B[200~";
+const END = "\x1B[201~";
+
+[Test]
+decodes_a_paste_as_one_event() {
+    expect_equal(decoded("a" + START + "hello world" + END + "b"), "key a,paste [hello world],key b");
+    expect_equal(decoded(START + END), "paste []");
+    expect_equal(decoded(START + "é€😀" + END), "paste [é€😀]");
+}
+
+[Test]
+gives_line_ends_as_line_feeds() {
+    expect_equal(decoded(START + "one\rtwo\r\nthree\nfour" + END), "paste [one\ntwo\nthree\nfour]");
+    # A line feed after the paste is a key again, not the end of its "\r".
+    expect_equal(decoded(START + "x\r" + END + "\n"), "paste [x\n],key Enter");
+}
+
+[Test]
+keeps_escape_bytes_inside_a_paste() {
+    var inside = "\x1B[A\x1B[20\x1B[201\x1B[200~\x1B";
+    expect_equal(decoded(START + inside + END + "z"), $"paste [{inside}],key z");
+}
+
+[Test]
+joins_a_paste_split_across_reads() {
+    var decoder = InputDecoder();
+    var events = Array<Event>();
+    for (var byte in (START + "ab\rc" + END + "q").bytes()) {
+        var one = Array<u8>();
+        one.append(byte);
+        events.append_all(decoder.feed(one));
+    }
+    expect_equal(describe(events), "paste [ab\nc],key q");
+    expect_false(decoder.pasting);
+    expect_false(decoder.has_pending);
+}
+
+[Test]
+gives_back_an_unterminated_paste_as_keys() {
+    var decoder = InputDecoder();
+    expect_equal(decoder.feed((START + "ab\r\x1B[2").bytes()).count, 0);
+    expect_true(decoder.pasting);
+    expect_true(decoder.has_pending);
+    expect_equal(describe(decoder.flush()), "key a,key b,key Enter,key Alt+[,key 2");
+    expect_false(decoder.pasting);
+    expect_false(decoder.has_pending);
+    # Decoding goes on as keys.
+    expect_equal(describe(decoder.feed("\x1B[A".bytes())), "key Up");
+    # Ended by the end of input before anything came.
+    expect_equal(decoded(START), "");
+}
+
+[Test]
+cuts_a_paste_at_its_limit() {
+    var decoder = InputDecoder(paste_limit = 4);
+    expect_equal(describe(decoder.feed((START + "abcdef" + END + "x").bytes())), "paste [abcd] cut,key x");
+    # Across reads, and never in the middle of a character.
+    expect_equal(decoder.feed((START + "ab").bytes()).count, 0);
+    expect_equal(describe(decoder.feed(("cé" + END).bytes())), "paste [abc] cut");
+    expect_equal(describe(decoder.feed((START + "abcd" + END).bytes())), "paste [abcd]");
+    expect_equal(InputDecoder().paste_limit, 1048576);
+}
+
+[Test]
+types_a_paste_for_the_readers_of_keys() {
+    var parts = Array<String>();
+    for (var key in KeyDecoder().feed((START + "a\rb" + END).bytes())) {
+        parts.append(key.to_string());
+    }
+    expect_equal(",".join(parts), "a,Enter,b");
+}
+
+[Test]
+pastes_into_a_line_without_submitting_it() {
+    var editor = LineEditor();
+    for (var key in KeyDecoder().feed("ac\x1B[D".bytes())) {
+        editor.handle(key);
+    }
+    editor.paste("1\n2\x1B[31m");
+    expect_equal(editor.text, "a1\n2\x1B[31mc");
+    expect_equal(editor.cursor, 9);
+    expect_equal(editor.history.entries.count, 0);
+    # Line ends and control characters show as one harmless column each.
+    expect_equal(editor.render("> "), "\r> a1⏎2\u{FFFD}[31mc\x1B[K\x1B[1D");
+    var status = EditStatus.Editing;
+    for (var key in KeyDecoder().feed("\r".bytes())) {
+        status = editor.handle(key);
+    }
+    expect_true(status == EditStatus.Submitted);
+    expect_equal(editor.history.entries[0], "a1\n2\x1B[31mc");
 }
