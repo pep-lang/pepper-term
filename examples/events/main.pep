@@ -33,6 +33,7 @@ main(): int {
                             var cut = truncated ? ", truncated" : "";
                             print($"paste of {text.size} bytes{cut}: {text.replace("\n", "\\n")}\r");
                         }
+                        ClipboardReply(text, truncated) => {}
                     }
                 }
             }

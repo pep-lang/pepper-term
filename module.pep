@@ -1,6 +1,7 @@
 ## Interactive terminal programs: raw mode, key and mouse input, bracketed
-## paste, line editing with history, cursor control, and 16, 256 and true
-## colors, on Linux, macOS (termios) and Windows (the Console API).
+## paste, the clipboard, line editing with history, cursor control, and 16,
+## 256 and true colors, on Linux, macOS (termios) and Windows (the Console
+## API).
 ##
 ## Bring it in with `import term`. Decoding input (`InputDecoder`) and
 ## editing lines (`LineEditor`) are pure, bytes in and events or text out,
@@ -16,6 +17,8 @@
 ##   on)
 ## - `InputReader`, `InputDecoder`, `Event`, `MouseEvent`, `MouseKind`,
 ##   `MouseButton`: key presses, mouse reports and pastes together
+## - `Clipboard`, `ClipboardBackend`, `ClipboardError`: copying to and
+##   reading from the clipboard, the OS's or the terminal's (OSC 52)
 ## - `LineReader`, `LineInput`, `LineEditor`, `EditStatus`, `History`:
 ##   readline-style line editing
 ## - `Style`, `Color`, `BasicColor`, `RESET`, `colors_enabled`: colors and
@@ -47,6 +50,7 @@
 
 # This file only gathers the module's public API from its other files.
 
+import "clipboard";
 import "keys";
 import "line";
 import "mouse";
@@ -99,3 +103,7 @@ export MouseMode;
 export PasteMode;
 export LineInput;
 export LineReader;
+export ClipboardBackend;
+export ClipboardError;
+export Clipboard;
+export _osc52_copy;

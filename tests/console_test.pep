@@ -6,7 +6,7 @@
 # there is no such console, and the test does nothing.
 
 import term;
-import [Event, Key, MouseTracking] from term;
+import [ClipboardBackend, Event, Key, MouseTracking] from term;
 
 [Target(OS(Windows))]
 extern void* GetStdHandle(uint which);
@@ -113,6 +113,7 @@ describe(event: Event?): String {
         Key(key) => $"key {key}",
         Mouse(mouse) => $"mouse {mouse}",
         Paste(pasted, truncated) => $"paste [{pasted}]",
+        ClipboardReply(copied, truncated) => $"clipboard [{copied}]",
     };
 }
 
@@ -188,6 +189,16 @@ read_the_console() {
             records.write(input);
             expect_equal(describe(reader.read()), "key Escape");
         }
+
+        # An OSC 52 read, answered with keys typed around the answer, which
+        # stay in the reader; then one nothing answers, which times out.
+        records.press_all("x\x1B]52;c;aGk=\x07y");
+        records.write(input);
+        var clipboard = term.Clipboard(ClipboardBackend.Osc52);
+        expect_equal(clipboard.read(timeout_ms = 2000, input = reader).ok_or("no answer"), "hi");
+        expect_equal(describe(reader.read()), "key x");
+        expect_equal(describe(reader.read()), "key y");
+        expect_true(clipboard.read(timeout_ms = 50, input = reader) is Err(TimedOut));
     }
     SetStdHandle(STD_INPUT, saved_input);
     SetStdHandle(STD_OUTPUT, saved_output);

@@ -7,6 +7,7 @@
 ## turns its mouse records into the SGR reports a POSIX terminal sends.
 ## Bracketed paste is asked for with the same sequence as on POSIX, which
 ## Windows Terminal answers; the older console host types pastes as keys.
+## The clipboard is Windows' own, as `CF_UNICODETEXT`.
 
 import async;
 import text;
@@ -40,6 +41,35 @@ extern int atexit(void* function);
 extern void* malloc(ulong size);
 [Target(OS(Windows))]
 extern void free(void* p);
+[Target(OS(Windows))]
+[Link("user32")]
+extern int OpenClipboard(void* owner);
+[Target(OS(Windows))]
+[Link("user32")]
+extern int CloseClipboard();
+[Target(OS(Windows))]
+[Link("user32")]
+extern int EmptyClipboard();
+[Target(OS(Windows))]
+[Link("user32")]
+extern void* SetClipboardData(uint format, void* memory);
+[Target(OS(Windows))]
+[Link("user32")]
+extern void* GetClipboardData(uint format);
+[Target(OS(Windows))]
+extern void* GlobalAlloc(uint flags, ulong size);
+[Target(OS(Windows))]
+extern void* GlobalLock(void* memory);
+[Target(OS(Windows))]
+extern int GlobalUnlock(void* memory);
+[Target(OS(Windows))]
+extern ulong GlobalSize(void* memory);
+[Target(OS(Windows))]
+extern void* GlobalFree(void* memory);
+[Target(OS(Windows))]
+extern uint GetLastError();
+[Target(OS(Windows))]
+extern void Sleep(uint milliseconds);
 
 # STD_INPUT_HANDLE and STD_OUTPUT_HANDLE: (DWORD)-10 and (DWORD)-11.
 [Target(OS(Windows))]
@@ -66,6 +96,13 @@ const _ENABLE_EXTENDED_FLAGS: uint = 128;
 # The output mode that makes the console read ANSI escape sequences.
 [Target(OS(Windows))]
 const _ENABLE_VIRTUAL_TERMINAL_PROCESSING: uint = 4;
+
+# The clipboard format of UTF-16 text, and GlobalAlloc's GMEM_MOVEABLE,
+# which SetClipboardData needs.
+[Target(OS(Windows))]
+const _CF_UNICODETEXT: uint = 13;
+[Target(OS(Windows))]
+const _GMEM_MOVEABLE: uint = 2;
 
 # The CRT's SIGABRT, which `abort` raises: what a panic ends with.
 [Target(OS(Windows))]
@@ -436,4 +473,83 @@ _term_restore_all() {
 [Target(OS(Windows))]
 _term_on_abort(number: int) {
     _term_restore_all();
+}
+
+# The OS's clipboard: Windows always has one.
+[Target(OS(Windows))]
+_term_clipboard_tool(): Result<String> {
+    return Result<String>.ok("the Windows clipboard");
+}
+
+# Opens the clipboard, which another program may hold for a moment: tries
+# for about 100 ms. Why it could not, or none.
+[Target(OS(Windows))]
+_term_clipboard_open(): String? {
+    for (var attempt in 0..10) {
+        if (OpenClipboard(__null) != 0) {
+            return Optional<String>.Empty;
+        }
+        Sleep(10);
+    }
+    return Optional<String>.Value($"OpenClipboard failed (error {GetLastError()})");
+}
+
+# Puts `copied` on the clipboard as CF_UNICODETEXT, in place of what it
+# held. `tool` is what `_term_clipboard_tool` gave, as on POSIX.
+[Target(OS(Windows))]
+_term_clipboard_copy(tool: String, copied: String): Result<void> {
+    var not_open = _term_clipboard_open();
+    if (!not_open.is_empty()) {
+        return Result<void>.err(Error(not_open.value()));
+    }
+    var units = text.Utf16.encode(copied);
+    var memory = GlobalAlloc(_GMEM_MOVEABLE, units.count + 2);
+    __ptr<u8> bytes = memory == __null ? __null : GlobalLock(memory);
+    var failure = "";
+    if (bytes == __null) {
+        failure = $"GlobalAlloc failed (error {GetLastError()})";
+    } else {
+        for (var index in 0..units.count) {
+            bytes[index] = units[index];
+        }
+        bytes[units.count] = 0;
+        bytes[units.count + 1] = 0;
+        GlobalUnlock(memory);
+        if (EmptyClipboard() == 0) {
+            failure = $"EmptyClipboard failed (error {GetLastError()})";
+        } else if (SetClipboardData(_CF_UNICODETEXT, memory) == __null) {
+            failure = $"SetClipboardData failed (error {GetLastError()})";
+        }
+    }
+    # The clipboard owns the memory once SetClipboardData takes it.
+    if (!failure.is_empty && memory != __null) {
+        GlobalFree(memory);
+    }
+    CloseClipboard();
+    return failure.is_empty ? Result<void>.ok() : Result<void>.err(Error(failure));
+}
+
+# The clipboard's text, empty when it holds none.
+[Target(OS(Windows))]
+_term_clipboard_read(tool: String): Result<String> {
+    var not_open = _term_clipboard_open();
+    if (!not_open.is_empty()) {
+        return Result<String>.err(Error(not_open.value()));
+    }
+    var utf16 = Array<u8>();
+    var memory = GetClipboardData(_CF_UNICODETEXT);
+    __ptr<ushort> units = memory == __null ? __null : GlobalLock(memory);
+    if (units != __null) {
+        # The text ends with a 0 unit, inside the block's size.
+        var size = GlobalSize(memory) / 2;
+        ulong index = 0;
+        while (index < size && units[index] != 0) {
+            utf16.append((units[index] & 255) as u8);
+            utf16.append((units[index] >> 8) as u8);
+            index += 1;
+        }
+        GlobalUnlock(memory);
+    }
+    CloseClipboard();
+    return Result<String>.ok(text.Utf16.decode_lossy(utf16));
 }
