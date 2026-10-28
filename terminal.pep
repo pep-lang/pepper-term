@@ -90,9 +90,8 @@ export colors_enabled(): bool {
 ##
 ## Use it in a `with` block, which turns raw mode off however the block
 ## ends. The terminal is also restored when the program ends while raw
-## mode is on: at the end of `main`, on a panic, and on SIGTERM, SIGHUP,
-## SIGINT or SIGQUIT (POSIX). `process.exit` ends the program without
-## running exit handlers, so call `restore()` before it.
+## mode is on: at the end of `main` or `process.exit`, on a panic, and on
+## SIGTERM, SIGHUP, SIGINT or SIGQUIT (POSIX).
 ##
 ## In raw mode on Linux and macOS, output is raw too: "\n" moves down
 ## without returning to the first column, so write "\r\n".
@@ -172,9 +171,9 @@ export enum MouseTracking {
 ## select and scroll.
 ##
 ## Use it in a `with` block, inside a `RawMode`'s. Like raw mode it is
-## turned off when the program ends while it is on: at the end of `main`,
-## on a panic, and on SIGTERM, SIGHUP, SIGINT or SIGQUIT (POSIX); call
-## `restore()` before `process.exit`.
+## turned off when the program ends while it is on: at the end of `main`
+## or `process.exit`, on a panic, and on SIGTERM, SIGHUP, SIGINT or SIGQUIT
+## (POSIX).
 ##
 ## On Linux and macOS it asks the terminal for xterm's reports in SGR
 ## encoding (mode 1006), which every current terminal speaks. On Windows
@@ -264,9 +263,8 @@ _mouse_mode_code(tracking: MouseTracking): int {
 ## unless a program asks.
 ##
 ## Use it in a `with` block. Like raw mode it is turned off when the
-## program ends while it is on: at the end of `main`, on a panic, and on
-## SIGTERM, SIGHUP, SIGINT or SIGQUIT (POSIX); call `restore()` before
-## `process.exit`.
+## program ends while it is on: at the end of `main` or `process.exit`, on
+## a panic, and on SIGTERM, SIGHUP, SIGINT or SIGQUIT (POSIX).
 ##
 ## It asks for xterm's bracketed paste (mode 2004), which current
 ## terminals on Linux and macOS, and Windows Terminal, have. A terminal
@@ -334,10 +332,10 @@ export struct PasteMode {
 extend PasteMode with Scoped<PasteMode>;
 
 ## Turns raw mode, mouse reporting and bracketed paste off now, wherever
-## they were turned on: for a program about to end with `process.exit`,
-## which runs no exit handlers. Does nothing when all are off.
+## they were turned on, before the program ends. Does nothing when all are
+## off. A copy started by `process.fork()` ends without exit handlers, so
+## it calls this before `process.exit`.
 export restore() {
-    # process.exit skips atexit handlers: pep-lang/pepper#73.
     _term_restore_all();
 }
 

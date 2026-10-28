@@ -76,10 +76,10 @@ is false, so `paint` leaves text plain.
 ## Restoring the terminal
 
 Raw mode is turned off when the `RawMode` goes away (use it in a `with`
-block), at the end of `main`, on a panic, and, on Linux and macOS, on
-SIGTERM, SIGHUP, SIGINT and SIGQUIT. Mouse reporting and bracketed paste
-are turned off on the same paths. `process.exit` ends the program without running exit
-handlers, so call `term.restore()` before it.
+block), at the end of `main` or `process.exit`, on a panic, and, on Linux
+and macOS, on SIGTERM, SIGHUP, SIGINT and SIGQUIT. Mouse reporting and
+bracketed paste are turned off on the same paths. `term.restore()` turns
+them all off early.
 
 ## Mouse input
 
