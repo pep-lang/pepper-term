@@ -129,6 +129,14 @@ for how in return panic signal forget; do
     after="$(cat "$build/typescript")"
     turned_off "$how" "$after" $'\e[?1006h' $'\e[?1006l\e[?1003l\e[?1002l\e[?1000l' "mouse reporting"
     turned_off "$how" "$after" $'\e[?2004h' $'\e[?2004l' "bracketed paste"
+    # A panic's message comes after the terminal is restored (the panic
+    # hook), so it is not lost in raw mode.
+    if [ "$how" = panic ]; then
+        case "${after##*$'\e[?2004l'}" in
+            *'on purpose, in raw mode'*) ;;
+            *) cat -v "$build/typescript" >&2; echo "error: the panic's message came before the terminal was restored" >&2; exit 1 ;;
+        esac
+    fi
 done
 
 # OSC 52 on a terminal (SSH_TTY makes Auto choose it): a copy writes the
