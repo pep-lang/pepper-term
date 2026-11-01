@@ -339,6 +339,24 @@ export restore() {
     _term_restore_all();
 }
 
+# A panic restores the terminal before it prints its message, so the
+# message lands on the terminal in its normal mode, then runs the hook
+# installed before. Installed before `main` runs, as module-scope values
+# are, and does nothing while every mode is off. `_term_restore_all` takes
+# no locks, so the hook is safe wherever the panic happens. A stack
+# overflow skips the hook; the SIGABRT handler still restores the terminal
+# then, after the message.
+const _term_panic_hook_installed = _term_install_panic_hook();
+
+_term_install_panic_hook(): bool {
+    var previous = take_panic_hook();
+    set_panic_hook((message, location) => {
+        _term_restore_all();
+        previous(message, location);
+    });
+    return true;
+}
+
 # How long to wait, after bytes that may start an escape sequence, for the
 # rest of it before deciding they were the Escape key.
 const _ESCAPE_WAIT_MS = 50;

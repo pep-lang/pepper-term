@@ -81,6 +81,14 @@ and macOS, on SIGTERM, SIGHUP, SIGINT and SIGQUIT. Mouse reporting and
 bracketed paste are turned off on the same paths. `term.restore()` turns
 them all off early.
 
+A panic turns them off before it prints its message, through the panic
+hook (`set_panic_hook`), so the message reaches the terminal in its
+normal mode. The package installs its hook before `main` runs and calls
+the hook that was there before; a program that installs its own later
+should call the one it replaces, as `take_panic_hook` explains. A stack
+overflow skips the hook, so its message is printed first, then the
+terminal is restored.
+
 ## Mouse input
 
 On Linux and macOS, `MouseMode` asks the terminal for xterm's reports
@@ -202,7 +210,8 @@ on Linux and
 macOS runs `tests/restore/main.pep` on a pseudo-terminal (through
 `script`). That checks the terminal's settings come back, and mouse
 reporting and bracketed paste are turned off, after a return, a panic,
-SIGTERM, and a `RawMode` kept alive past `main`, and that an OSC 52
+SIGTERM, and a `RawMode` kept alive past `main`, that a panic's message
+comes after they are turned off, and that an OSC 52
 copy is written and a read the terminal does not answer times out.
 
 ## Releasing
